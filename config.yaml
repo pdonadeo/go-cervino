@@ -1,0 +1,9 @@
+providers:
+  - label: GMail
+    host: imap.gmail.com
+    port: 993
+    username: my.email@gmail.com
+    password: my-passw0rd!
+    mailbox: INBOX
+    sound: /usr/share/sounds/freedesktop/stereo/message.oga
+    icon: mail-unread
