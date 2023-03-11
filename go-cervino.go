@@ -250,7 +250,10 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 
 			err = <-done
 			if err != nil {
-				log.Errorf("%s: %s", conf.Label, err)
+				log.Errorf("%s: an error occurred: %s", conf.Label, err)
+				log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
+				time.Sleep(5 * time.Second)
+				go RunIMAPClient(log, conf, wg, stopChannel)
 				return
 			}
 
@@ -261,8 +264,10 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 
 				inboxStatus, err := c.Select(conf.Mailbox, false)
 				if err != nil {
-					log.Errorf("%s: %s", conf.Label, err)
-					wg.Done()
+					log.Errorf("%s: an error occurred: %s", conf.Label, err)
+					log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
+					time.Sleep(5 * time.Second)
+					go RunIMAPClient(log, conf, wg, stopChannel)
 					return
 				}
 				updates = make(chan client.Update, 128)
@@ -270,7 +275,10 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 
 				mboxMap, err = UpdateMessagesMap(log, conf, mboxMap, inboxStatus, c, false)
 				if err != nil {
-					log.Errorf("%s: %s", conf.Label, err)
+					log.Errorf("%s: an error occurred: %s", conf.Label, err)
+					log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
+					time.Sleep(5 * time.Second)
+					go RunIMAPClient(log, conf, wg, stopChannel)
 					return
 				}
 
@@ -292,7 +300,10 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 
 			err = <-done
 			if err != nil {
-				log.Errorf("%s: %s", conf.Label, err)
+				log.Errorf("%s: an error occurred: %s", conf.Label, err)
+				log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
+				time.Sleep(5 * time.Second)
+				go RunIMAPClient(log, conf, wg, stopChannel)
 				return
 			}
 			stop = make(chan struct{})
