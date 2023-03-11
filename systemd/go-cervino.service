@@ -1,0 +1,10 @@
+[Unit]
+Description=Start and stop IMAP notifier go-cervino
+Before=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/go-cervino -c %h/.config/go-cervino/config.yaml
+
+[Install]
+WantedBy=default.target
