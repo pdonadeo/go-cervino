@@ -76,7 +76,7 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 	mboxMap map[uint32]imap.Message,
 	mboxStatus *imap.MailboxStatus,
 	c *client.Client,
-	all bool) (map[uint32]imap.Message, error) {
+	alsoNewMessages bool) (map[uint32]imap.Message, error) {
 
 	PrintMailboxStatus(log, "UpdateMessageMap", conf, mboxStatus)
 	if mboxStatus.Messages == 0 {
@@ -84,7 +84,7 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 		return mboxMap, nil
 	}
 	from := uint32(0)
-	if all {
+	if alsoNewMessages {
 		from = 1
 	} else {
 		if mboxStatus.UnseenSeqNum == 0 {
@@ -110,6 +110,7 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 		_, exists := mboxMap[msg.SeqNum]
 		if !exists {
 			mboxMap[msg.SeqNum] = *msg
+
 			isRecent := false
 			for _, f := range msg.Flags {
 				if f == imap.RecentFlag {
@@ -117,7 +118,16 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 					break
 				}
 			}
-			if !all || isRecent {
+
+			isNew := true
+			for _, f := range msg.Flags {
+				if f == imap.SeenFlag {
+					isNew = false
+					break
+				}
+			}
+
+			if (alsoNewMessages && isNew) || isRecent {
 				ntf := notify.NewNotification(
 					"New email in "+conf.Label,
 					fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, msg.Envelope.From[0].PersonalName))
