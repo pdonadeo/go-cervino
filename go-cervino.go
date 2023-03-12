@@ -217,7 +217,7 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 		conf.Mailbox = "INBOX"
 	}
 
-	inboxStatus, err := c.Select(conf.Mailbox, false)
+	inboxStatus, err := c.Select(conf.Mailbox, true)
 	if err != nil {
 		log.Errorf("%s: %s", conf.Label, err)
 		wg.Done()
@@ -277,7 +277,7 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 				close(updates)
 				c.Updates = nil
 
-				inboxStatus, err := c.Select(conf.Mailbox, false)
+				inboxStatus, err := c.Select(conf.Mailbox, true)
 				if err != nil {
 					log.Errorf("%s: an error occurred: %s", conf.Label, err)
 					log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
