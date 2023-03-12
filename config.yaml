@@ -7,3 +7,4 @@ providers:
     mailbox: INBOX
     sound: /usr/share/sounds/freedesktop/stereo/message.oga
     icon: mail-unread
+    timeout: 5

@@ -26,6 +26,7 @@ type ProviderConfiguration struct {
 	Mailbox  string
 	Sound    string
 	Icon     string
+	Timeout  int32
 }
 
 type Configuration struct {
@@ -137,7 +138,11 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 				} else {
 					ntf.AppIcon = conf.Icon
 				}
-				ntf.Timeout = notify.ExpiresNever
+				if conf.Timeout > 0 {
+					ntf.Timeout = conf.Timeout * 1000
+				} else {
+					ntf.Timeout = notify.ExpiresNever
+				}
 				ntf.Hints = make(map[string]interface{})
 				if conf.Sound != "" {
 					ntf.Hints[notify.HintSoundFile] = conf.Sound
