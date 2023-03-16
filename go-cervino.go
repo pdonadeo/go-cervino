@@ -382,14 +382,12 @@ func main() {
 		go RunIMAPClient(log, conf, &wg, stop)
 	}
 
-	wg.Add(1)
 	go func() {
 		s := <-signalChannel
 		log.Infof("Signal %s received", s.String())
 		for _, stop := range stopChannels {
 			stop <- true
 		}
-		wg.Done()
 	}()
 	signal.Notify(signalChannel, syscall.SIGTERM)
 	signal.Notify(signalChannel, syscall.SIGINT)
