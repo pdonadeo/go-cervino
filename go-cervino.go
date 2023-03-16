@@ -197,7 +197,9 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 	c, err := client.DialTLS(host_port, nil)
 	if err != nil {
 		log.Error(err)
-		wg.Done()
+		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
+		time.Sleep(5 * time.Second)
+		go RunIMAPClient(log, conf, wg, stopChannel)
 		return
 	}
 	log.Debugf("...%s connected", conf.Label)
@@ -208,7 +210,9 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 
 	if err := c.Login(conf.Username, conf.Password); err != nil {
 		log.Errorf("%s: %s", conf.Label, err)
-		wg.Done()
+		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
+		time.Sleep(5 * time.Second)
+		go RunIMAPClient(log, conf, wg, stopChannel)
 		return
 	}
 	log.Debugf("%s logged in", conf.Label)
@@ -220,7 +224,9 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 	inboxStatus, err := c.Select(conf.Mailbox, true)
 	if err != nil {
 		log.Errorf("%s: %s", conf.Label, err)
-		wg.Done()
+		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
+		time.Sleep(5 * time.Second)
+		go RunIMAPClient(log, conf, wg, stopChannel)
 		return
 	}
 
@@ -228,7 +234,9 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 	mboxMap, err = UpdateMessagesMap(log, conf, mboxMap, inboxStatus, c, true)
 	if err != nil {
 		log.Errorf("%s: %s", conf.Label, err)
-		wg.Done()
+		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
+		time.Sleep(5 * time.Second)
+		go RunIMAPClient(log, conf, wg, stopChannel)
 		return
 	}
 
