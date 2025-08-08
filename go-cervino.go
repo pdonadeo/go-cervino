@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -33,19 +34,17 @@ type Configuration struct {
 	Providers []ProviderConfiguration `yaml:"providers"`
 }
 
-var UnlockDelay = 1 * time.Second
-
-var AppName = "go-cervino"
+var appName = "go-cervino"
 
 func keys[K comparable, V any](m map[K]V) []K {
-	keys := make([]K, 0, len(m))
+	out := make([]K, 0, len(m))
 	for k := range m {
-		keys = append(keys, k)
+		out = append(out, k)
 	}
-	return keys
+	return out
 }
 
-func PrintMessage(log *zap.SugaredLogger, conf ProviderConfiguration, msg imap.Message) {
+func printMessage(log *zap.SugaredLogger, conf ProviderConfiguration, msg imap.Message) {
 	log.Debugf("%s: EMAIL %d", conf.Label, msg.SeqNum)
 	log.Debugf("%s: \tDATE = %s", conf.Label, msg.Envelope.Date)
 	log.Debugf("%s: \tSUBJECT = %s", conf.Label, msg.Envelope.Subject)
@@ -58,33 +57,35 @@ func PrintMessage(log *zap.SugaredLogger, conf ProviderConfiguration, msg imap.M
 	log.Debugf("%s: \tMESSAGE-ID = %s", conf.Label, msg.Envelope.MessageId)
 }
 
-func PrintMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages map[uint32]imap.Message) {
-	keys := keys(messages)
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	for _, k := range keys {
-		msg := messages[k]
-		PrintMessage(log, conf, msg)
+func printMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages map[uint32]imap.Message) {
+	k := keys(messages)
+	sort.Slice(k, func(i, j int) bool { return k[i] < k[j] })
+	for _, seq := range k {
+		printMessage(log, conf, messages[seq])
 	}
 }
 
-func PrintMailboxStatus(log *zap.SugaredLogger, msg string, conf ProviderConfiguration, mboxStatus *imap.MailboxStatus) {
+func printMailboxStatus(log *zap.SugaredLogger, msg string, conf ProviderConfiguration, mboxStatus *imap.MailboxStatus) {
 	log.Debugf("%s: %s", conf.Label, msg)
 	log.Debugf("%s: Mailbox update: %d messages, %d recent, %d unseen, %d unseenSeqNum",
 		conf.Label, mboxStatus.Messages, mboxStatus.Recent, mboxStatus.Unseen, mboxStatus.UnseenSeqNum)
 }
 
-func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
+func updateMessagesMap(
+	log *zap.SugaredLogger,
+	conf ProviderConfiguration,
 	mboxMap map[uint32]imap.Message,
 	mboxStatus *imap.MailboxStatus,
 	c *client.Client,
 	alsoNewMessages bool,
 ) (map[uint32]imap.Message, error) {
-	PrintMailboxStatus(log, "UpdateMessageMap", conf, mboxStatus)
+	printMailboxStatus(log, "UpdateMessageMap", conf, mboxStatus)
 	if mboxStatus.Messages == 0 {
 		log.Debugf("%s: UpdateMessageMap: mboxStatus.Messages == 0", conf.Label)
 		return mboxMap, nil
 	}
-	from := uint32(0)
+
+	var from uint32
 	if alsoNewMessages {
 		from = 1
 	} else {
@@ -94,9 +95,8 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 			from = mboxStatus.UnseenSeqNum
 		}
 	}
-	log.Debugf("%s: UpdateMessageMap: from = %d", conf.Label, from)
 	to := mboxStatus.Messages
-	log.Debugf("%s: UpdateMessageMap: to = %d", conf.Label, to)
+	log.Debugf("%s: UpdateMessageMap: from=%d to=%d", conf.Label, from, to)
 
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, to)
@@ -108,8 +108,7 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 	}()
 
 	for msg := range messages {
-		_, exists := mboxMap[msg.SeqNum]
-		if !exists {
+		if _, exists := mboxMap[msg.SeqNum]; !exists {
 			mboxMap[msg.SeqNum] = *msg
 
 			isRecent := false
@@ -132,7 +131,7 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 				ntf := notify.NewNotification(
 					"New email in "+conf.Label,
 					fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, msg.Envelope.From[0].PersonalName))
-				ntf.AppName = AppName
+				ntf.AppName = appName
 				if conf.Icon == "" {
 					ntf.AppIcon = "mail-unread"
 				} else {
@@ -156,183 +155,132 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 		return nil, err
 	}
 
-	PrintMessages(log, conf, mboxMap)
-
+	printMessages(log, conf, mboxMap)
 	return mboxMap, nil
 }
 
-func Expunge(
+func expunge(
 	log *zap.SugaredLogger,
 	conf ProviderConfiguration,
 	mboxMap map[uint32]imap.Message,
-	c *client.Client,
 	seqNum uint32,
 ) map[uint32]imap.Message {
-	keys := keys(mboxMap)
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	k := keys(mboxMap)
+	sort.Slice(k, func(i, j int) bool { return k[i] < k[j] })
 
 	newMboxMap := make(map[uint32]imap.Message)
 	newSeqNum := uint32(1)
-	for _, k := range keys {
-		msg := mboxMap[k]
+	for _, key := range k {
+		msg := mboxMap[key]
 		if msg.SeqNum != seqNum {
 			msg.SeqNum = newSeqNum
 			newMboxMap[newSeqNum] = msg
 			newSeqNum++
 		}
 	}
-
-	PrintMessages(log, conf, newMboxMap)
-
+	printMessages(log, conf, newMboxMap)
 	return newMboxMap
 }
 
-func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.WaitGroup, stopChannel chan bool) {
-	keepAliveTicker := time.NewTicker(5 * time.Minute)
-
-	log.Debugf("Connecting to \"%s\"...", conf.Label)
-
-	// Connect to server
-	hostAndPort := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
-	c, err := client.DialTLS(hostAndPort, nil)
-	if err != nil {
-		log.Error(err)
-		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
-		time.Sleep(5 * time.Second)
-		go RunIMAPClient(log, conf, wg, stopChannel)
-		return
-	}
-	log.Debugf("...%s connected", conf.Label)
-
-	if log.Level() == zap.DebugLevel {
-		c.SetDebug(os.Stdout)
-	}
-
-	if err = c.Login(conf.Username, conf.Password); err != nil {
-		log.Errorf("%s: %s", conf.Label, err)
-		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
-		time.Sleep(5 * time.Second)
-		go RunIMAPClient(log, conf, wg, stopChannel)
-		return
-	}
-	log.Debugf("%s logged in", conf.Label)
-
-	if conf.Mailbox == "" {
-		conf.Mailbox = "INBOX"
-	}
-
-	inboxStatus, err := c.Select(conf.Mailbox, true)
-	if err != nil {
-		log.Errorf("%s: %s", conf.Label, err)
-		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
-		time.Sleep(5 * time.Second)
-		go RunIMAPClient(log, conf, wg, stopChannel)
-		return
-	}
-
-	mboxMap := make(map[uint32]imap.Message)
-	mboxMap, err = UpdateMessagesMap(log, conf, mboxMap, inboxStatus, c, true)
-	if err != nil {
-		log.Errorf("%s: %s", conf.Label, err)
-		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
-		time.Sleep(5 * time.Second)
-		go RunIMAPClient(log, conf, wg, stopChannel)
-		return
-	}
-
-	done := make(chan error, 1)
-	// Create a channel to receive mailbox updates
-	updates := make(chan client.Update, 128)
-	c.Updates = updates
-
-	stop := make(chan struct{})
-	stopIsClosed := false
-
-	defer func() {
-		log.Infof("%s: Logout", conf.Label)
-		if !stopIsClosed {
-			close(stop)
-			stopIsClosed = true
-		}
-		err = <-done
-		if err != nil {
-			log.Errorf("%s: %s", conf.Label, err)
-		}
-		_ = c.Logout()
-		wg.Done()
-	}()
-
-	go func() { done <- c.Idle(stop, nil) }()
+func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration) {
+	keepAlive := 5 * time.Minute
 
 	for {
 		select {
-		case update := <-updates:
-			log.Debugf("%s: endless loop: updates", conf.Label)
-			close(stop)
-			stopIsClosed = true
-
-			err = <-done
-			if err != nil {
-				log.Errorf("%s: an error occurred: %s", conf.Label, err)
-				log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
-				time.Sleep(5 * time.Second)
-				go RunIMAPClient(log, conf, wg, stopChannel)
-				return
-			}
-
-			switch update := update.(type) {
-			case *client.MailboxUpdate:
-				close(updates)
-				c.Updates = nil
-
-				inboxStatus, err = c.Select(conf.Mailbox, true)
-				if err != nil {
-					log.Errorf("%s: an error occurred: %s", conf.Label, err)
-					log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
-					time.Sleep(5 * time.Second)
-					go RunIMAPClient(log, conf, wg, stopChannel)
-					return
-				}
-				updates = make(chan client.Update, 128)
-				c.Updates = updates
-
-				mboxMap, err = UpdateMessagesMap(log, conf, mboxMap, inboxStatus, c, false)
-				if err != nil {
-					log.Errorf("%s: an error occurred: %s", conf.Label, err)
-					log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
-					time.Sleep(5 * time.Second)
-					go RunIMAPClient(log, conf, wg, stopChannel)
-					return
-				}
-
-			case *client.ExpungeUpdate:
-				mboxMap = Expunge(log, conf, mboxMap, c, update.SeqNum)
-			}
-			stop = make(chan struct{})
-			stopIsClosed = false
-			go func() { done <- c.Idle(stop, nil) }()
-
-		case <-stopChannel:
-			log.Debugf("%s: endless loop: <-stopChannel", conf.Label)
+		case <-ctx.Done():
 			return
-
-		case <-keepAliveTicker.C:
-			log.Debugf("%s: endless loop: <-keepAliveTicker.C", conf.Label)
-			close(stop)
-			stopIsClosed = true
-
-			err = <-done
-			if err != nil {
-				log.Errorf("%s: an error occurred: %s", conf.Label, err)
-				log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
-				time.Sleep(5 * time.Second)
-				go RunIMAPClient(log, conf, wg, stopChannel)
-				return
-			}
-			stop = make(chan struct{})
-			stopIsClosed = false
-			go func() { done <- c.Idle(stop, nil) }()
+		default:
 		}
+
+		log.Debugf("Connecting to \"%s\"...", conf.Label)
+		c, err := client.DialTLS(fmt.Sprintf("%s:%d", conf.Host, conf.Port), nil)
+		if err != nil {
+			log.Error(err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		log.Debugf("...%s connected", conf.Label)
+
+		if err = c.Login(conf.Username, conf.Password); err != nil {
+			log.Errorf("%s: %s", conf.Label, err)
+			_ = c.Logout()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		log.Debugf("%s logged in", conf.Label)
+
+		if conf.Mailbox == "" {
+			conf.Mailbox = "INBOX"
+		}
+		inboxStatus, err := c.Select(conf.Mailbox, true)
+		if err != nil {
+			log.Errorf("%s: %s", conf.Label, err)
+			_ = c.Logout()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		mboxMap := make(map[uint32]imap.Message)
+		mboxMap, err = updateMessagesMap(log, conf, mboxMap, inboxStatus, c, true)
+		if err != nil {
+			log.Errorf("%s: %s", conf.Label, err)
+			_ = c.Logout()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		updates := make(chan client.Update, 128)
+		c.Updates = updates
+
+		stopIdle := make(chan struct{})
+		doneIdle := make(chan error, 1)
+		go func() { doneIdle <- c.Idle(stopIdle, nil) }()
+
+	loop:
+		for {
+			select {
+			case <-ctx.Done():
+				close(stopIdle)
+				<-doneIdle
+				_ = c.Logout()
+				return
+
+			case update := <-updates:
+				close(stopIdle)
+				<-doneIdle
+
+				switch u := update.(type) {
+				case *client.MailboxUpdate:
+					inboxStatus, err = c.Select(conf.Mailbox, true)
+					if err != nil {
+						log.Errorf("%s: %s", conf.Label, err)
+						break loop
+					}
+					mboxMap, err = updateMessagesMap(log, conf, mboxMap, inboxStatus, c, false)
+					if err != nil {
+						log.Errorf("%s: %s", conf.Label, err)
+						break loop
+					}
+
+				case *client.ExpungeUpdate:
+					mboxMap = expunge(log, conf, mboxMap, u.SeqNum)
+				}
+
+				stopIdle = make(chan struct{})
+				doneIdle = make(chan error, 1)
+				go func() { doneIdle <- c.Idle(stopIdle, nil) }()
+
+			case <-time.After(keepAlive):
+				close(stopIdle)
+				<-doneIdle
+				stopIdle = make(chan struct{})
+				doneIdle = make(chan error, 1)
+				go func() { doneIdle <- c.Idle(stopIdle, nil) }()
+			}
+		}
+
+		_ = c.Logout()
+		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -342,9 +290,10 @@ func main() {
 	level.SetLevel(zap.InfoLevel)
 	config.Level = level
 	logger, _ := config.Build()
+
 	defer func() {
 		if err := logger.Sync(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error syncing logger: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error syncing logger: %s\n", err)
 		}
 	}()
 
@@ -363,39 +312,28 @@ func main() {
 		level.SetLevel(zap.DebugLevel)
 	}
 
-	log.Infof("Starting %s", AppName)
+	log.Infof("Starting %s", appName)
 
 	data, err := os.ReadFile(confFile)
 	if err != nil {
 		log.Fatalf("Error reading configuration file: %s", err)
 	}
 
-	err = yaml.Unmarshal([]byte(data), &configuration)
-	if err != nil {
-		log.Fatalf("Error reading configuration file: %s", err)
+	if err = yaml.Unmarshal(data, &configuration); err != nil {
+		log.Fatalf("Error parsing configuration file: %s", err)
 	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
 
 	var wg sync.WaitGroup
-	signalChannel := make(chan os.Signal, 1)
-
-	stopChannels := make([]chan bool, len(configuration.Providers))
-
-	for idx, conf := range configuration.Providers {
-		stop := make(chan bool, 1)
-		stopChannels[idx] = stop
+	for _, conf := range configuration.Providers {
 		wg.Add(1)
-		go RunIMAPClient(log, conf, &wg, stop)
+		go func(c ProviderConfiguration) {
+			defer wg.Done()
+			runIMAPClient(ctx, log, c)
+		}(conf)
 	}
-
-	go func() {
-		s := <-signalChannel
-		log.Infof("Signal %s received", s.String())
-		for _, stop := range stopChannels {
-			stop <- true
-		}
-	}()
-	signal.Notify(signalChannel, syscall.SIGTERM)
-	signal.Notify(signalChannel, syscall.SIGINT)
 
 	wg.Wait()
 }
