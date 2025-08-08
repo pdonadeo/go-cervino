@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -14,20 +19,31 @@ import (
 	"github.com/TheCreeper/go-notify"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-sasl"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
+// OAuth2Config contiene i campi necessari per ottenere access token da refresh token.
+type OAuth2Config struct {
+	ClientID     string `yaml:"client_id"`
+	ClientSecret string `yaml:"client_secret"`
+	RefreshToken string `yaml:"refresh_token"`
+	TokenURL     string `yaml:"token_url"`
+	Scope        string `yaml:"scope"`
+}
+
 type ProviderConfiguration struct {
-	Label    string
-	Host     string
-	Port     int
-	Username string
-	Password string
-	Mailbox  string
-	Sound    string
-	Icon     string
-	Timeout  int32
+	Label    string        `yaml:"label"`
+	Host     string        `yaml:"host"`
+	Port     int           `yaml:"port"`
+	Username string        `yaml:"username"`
+	Password string        `yaml:"password"`
+	Mailbox  string        `yaml:"mailbox"`
+	Sound    string        `yaml:"sound"`
+	Icon     string        `yaml:"icon"`
+	Timeout  int32         `yaml:"timeout"`
+	OAuth2   *OAuth2Config `yaml:"oauth2"`
 }
 
 type Configuration struct {
@@ -35,6 +51,18 @@ type Configuration struct {
 }
 
 var appName = "go-cervino"
+
+// tokenCacheItem mantiene un access token e la scadenza.
+type tokenCacheItem struct {
+	AccessToken string
+	Expiry      time.Time
+}
+
+// cache in memoria per token
+var tokenCache = struct {
+	sync.Mutex
+	m map[string]tokenCacheItem
+}{m: make(map[string]tokenCacheItem)}
 
 func keys[K comparable, V any](m map[K]V) []K {
 	out := make([]K, 0, len(m))
@@ -108,6 +136,9 @@ func updateMessagesMap(
 	}()
 
 	for msg := range messages {
+		if msg == nil {
+			continue
+		}
 		if _, exists := mboxMap[msg.SeqNum]; !exists {
 			mboxMap[msg.SeqNum] = *msg
 
@@ -128,9 +159,13 @@ func updateMessagesMap(
 			}
 
 			if (alsoNewMessages && isNew) || isRecent {
+				fromName := ""
+				if len(msg.Envelope.From) > 0 {
+					fromName = msg.Envelope.From[0].PersonalName
+				}
 				ntf := notify.NewNotification(
 					"New email in "+conf.Label,
-					fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, msg.Envelope.From[0].PersonalName))
+					fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, fromName))
 				ntf.AppName = appName
 				if conf.Icon == "" {
 					ntf.AppIcon = "mail-unread"
@@ -182,6 +217,114 @@ func expunge(
 	return newMboxMap
 }
 
+// getAccessTokenFromRefreshToken esegue la chiamata al token endpoint per ottenere un access token
+// a partire da un refresh_token. Restituisce anche la scadenza (expires_in).
+func getAccessTokenFromRefreshToken(ctx context.Context, oauth *OAuth2Config) (string, time.Time, error) {
+	if oauth.TokenURL == "" {
+		return "", time.Time{}, fmt.Errorf("token_url non impostato in configurazione OAuth2")
+	}
+
+	form := url.Values{}
+	form.Set("client_id", oauth.ClientID)
+	form.Set("client_secret", oauth.ClientSecret)
+	form.Set("refresh_token", oauth.RefreshToken)
+	form.Set("grant_type", "refresh_token")
+	if oauth.Scope != "" {
+		form.Set("scope", oauth.Scope)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", oauth.TokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", time.Time{}, fmt.Errorf("token endpoint returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int64  `json:"expires_in"`
+		TokenType   string `json:"token_type"`
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(&tokenResp); err != nil {
+		return "", time.Time{}, err
+	}
+
+	expiry := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	if tokenResp.ExpiresIn == 0 {
+		expiry = time.Now().Add(1 * time.Hour)
+	}
+
+	return tokenResp.AccessToken, expiry, nil
+}
+
+// fetchAccessToken usa la cache e rinnova l'access token se necessario.
+// cacheKey è composta da token_url|username|label per separare provider diversi.
+func fetchAccessToken(ctx context.Context, label string, username string, oauth *OAuth2Config) (string, error) {
+	cacheKey := oauth.TokenURL + "|" + username + "|" + label
+
+	tokenCache.Lock()
+	item, ok := tokenCache.m[cacheKey]
+	tokenCache.Unlock()
+
+	const margin = 60 * time.Second
+
+	if ok && time.Now().Add(margin).Before(item.Expiry) && item.AccessToken != "" {
+		return item.AccessToken, nil
+	}
+
+	accessToken, expiry, err := getAccessTokenFromRefreshToken(ctx, oauth)
+	if err != nil {
+		return "", err
+	}
+
+	tokenCache.Lock()
+	tokenCache.m[cacheKey] = tokenCacheItem{
+		AccessToken: accessToken,
+		Expiry:      expiry,
+	}
+	tokenCache.Unlock()
+
+	return accessToken, nil
+}
+
+// Implementazione minimale di SASL XOAUTH2 come sasl.Client per go-sasl
+type xoauth2Client struct {
+	username string
+	token    string
+	started  bool
+}
+
+func NewXOAuth2(username, token string) sasl.Client {
+	return &xoauth2Client{username: username, token: token}
+}
+
+// Start ritorna il meccanismo e la initial response richiesta da XOAUTH2
+func (c *xoauth2Client) Start() (string, []byte, error) {
+	// Formato: "user=<user>\x01auth=Bearer <accessToken>\x01\x01"
+	ir := []byte("user=" + c.username + "\x01auth=Bearer " + c.token + "\x01\x01")
+	c.started = true
+	return "XOAUTH2", ir, nil
+}
+
+// Next non viene usato da XOAUTH2 (nessuna challenge-response prevista)
+func (c *xoauth2Client) Next(challenge []byte) ([]byte, error) {
+	// Non ci aspettiamo challenge; rispondiamo con nil
+	return nil, nil
+}
+
 func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration) {
 	keepAlive := 5 * time.Minute
 
@@ -193,19 +336,48 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		}
 
 		log.Debugf("Connecting to \"%s\"...", conf.Label)
-		c, err := client.DialTLS(fmt.Sprintf("%s:%d", conf.Host, conf.Port), nil)
+		addr := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
+		c, err := client.DialTLS(addr, nil)
 		if err != nil {
-			log.Error(err)
+			log.Errorf("%s: connection error: %v", conf.Label, err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 		log.Debugf("...%s connected", conf.Label)
 
-		if err = c.Login(conf.Username, conf.Password); err != nil {
-			log.Errorf("%s: %s", conf.Label, err)
-			_ = c.Logout()
-			time.Sleep(5 * time.Second)
-			continue
+		// Autenticazione: password classica oppure OAuth2 XOAUTH2
+		if conf.OAuth2 != nil {
+			tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			token, err := fetchAccessToken(tctx, conf.Label, conf.Username, conf.OAuth2)
+			cancel()
+			if err != nil {
+				log.Errorf("%s: cannot get OAuth2 token: %v", conf.Label, err)
+				_ = c.Logout()
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			auth := NewXOAuth2(conf.Username, token)
+			if err := c.Authenticate(auth); err != nil {
+				log.Errorf("%s: OAuth2 auth failed: %v", conf.Label, err)
+				_ = c.Logout()
+				time.Sleep(5 * time.Second)
+
+				// Invalida cache per forzare refresh la prossima volta
+				cacheKey := conf.OAuth2.TokenURL + "|" + conf.Username + "|" + conf.Label
+				tokenCache.Lock()
+				delete(tokenCache.m, cacheKey)
+				tokenCache.Unlock()
+
+				continue
+			}
+		} else {
+			if err := c.Login(conf.Username, conf.Password); err != nil {
+				log.Errorf("%s: login error: %v", conf.Label, err)
+				_ = c.Logout()
+				time.Sleep(5 * time.Second)
+				continue
+			}
 		}
 		log.Debugf("%s logged in", conf.Label)
 
@@ -214,7 +386,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		}
 		inboxStatus, err := c.Select(conf.Mailbox, true)
 		if err != nil {
-			log.Errorf("%s: %s", conf.Label, err)
+			log.Errorf("%s: select error: %v", conf.Label, err)
 			_ = c.Logout()
 			time.Sleep(5 * time.Second)
 			continue
@@ -223,7 +395,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		mboxMap := make(map[uint32]imap.Message)
 		mboxMap, err = updateMessagesMap(log, conf, mboxMap, inboxStatus, c, true)
 		if err != nil {
-			log.Errorf("%s: %s", conf.Label, err)
+			log.Errorf("%s: update messages error: %v", conf.Label, err)
 			_ = c.Logout()
 			time.Sleep(5 * time.Second)
 			continue
@@ -253,12 +425,12 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 				case *client.MailboxUpdate:
 					inboxStatus, err = c.Select(conf.Mailbox, true)
 					if err != nil {
-						log.Errorf("%s: %s", conf.Label, err)
+						log.Errorf("%s: select after update error: %v", conf.Label, err)
 						break loop
 					}
 					mboxMap, err = updateMessagesMap(log, conf, mboxMap, inboxStatus, c, false)
 					if err != nil {
-						log.Errorf("%s: %s", conf.Label, err)
+						log.Errorf("%s: updateMessagesMap error: %v", conf.Label, err)
 						break loop
 					}
 
