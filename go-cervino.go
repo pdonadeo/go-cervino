@@ -77,8 +77,8 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 	mboxMap map[uint32]imap.Message,
 	mboxStatus *imap.MailboxStatus,
 	c *client.Client,
-	alsoNewMessages bool) (map[uint32]imap.Message, error) {
-
+	alsoNewMessages bool,
+) (map[uint32]imap.Message, error) {
 	PrintMailboxStatus(log, "UpdateMessageMap", conf, mboxStatus)
 	if mboxStatus.Messages == 0 {
 		log.Debugf("%s: UpdateMessageMap: mboxStatus.Messages == 0", conf.Label)
@@ -147,7 +147,7 @@ func UpdateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration,
 				if conf.Sound != "" {
 					ntf.Hints[notify.HintSoundFile] = conf.Sound
 				}
-				ntf.Show()
+				_, _ = ntf.Show()
 			}
 		}
 	}
@@ -166,8 +166,8 @@ func Expunge(
 	conf ProviderConfiguration,
 	mboxMap map[uint32]imap.Message,
 	c *client.Client,
-	seqNum uint32) map[uint32]imap.Message {
-
+	seqNum uint32,
+) map[uint32]imap.Message {
 	keys := keys(mboxMap)
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
@@ -193,8 +193,8 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 	log.Debugf("Connecting to \"%s\"...", conf.Label)
 
 	// Connect to server
-	host_port := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
-	c, err := client.DialTLS(host_port, nil)
+	hostAndPort := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
+	c, err := client.DialTLS(hostAndPort, nil)
 	if err != nil {
 		log.Error(err)
 		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
@@ -208,7 +208,7 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 		c.SetDebug(os.Stdout)
 	}
 
-	if err := c.Login(conf.Username, conf.Password); err != nil {
+	if err = c.Login(conf.Username, conf.Password); err != nil {
 		log.Errorf("%s: %s", conf.Label, err)
 		log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
 		time.Sleep(5 * time.Second)
@@ -254,11 +254,11 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 			close(stop)
 			stopIsClosed = true
 		}
-		err := <-done
+		err = <-done
 		if err != nil {
 			log.Errorf("%s: %s", conf.Label, err)
 		}
-		c.Logout()
+		_ = c.Logout()
 		wg.Done()
 	}()
 
@@ -285,7 +285,7 @@ func RunIMAPClient(log *zap.SugaredLogger, conf ProviderConfiguration, wg *sync.
 				close(updates)
 				c.Updates = nil
 
-				inboxStatus, err := c.Select(conf.Mailbox, true)
+				inboxStatus, err = c.Select(conf.Mailbox, true)
 				if err != nil {
 					log.Errorf("%s: an error occurred: %s", conf.Label, err)
 					log.Infof("%s: sleeping 5 seconds and restarting IMAP client", conf.Label)
@@ -342,7 +342,12 @@ func main() {
 	level.SetLevel(zap.InfoLevel)
 	config.Level = level
 	logger, _ := config.Build()
-	defer logger.Sync()
+	defer func() {
+		if err := logger.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error syncing logger: %v\n", err)
+		}
+	}()
+
 	log := logger.Sugar()
 
 	var configuration Configuration
@@ -371,9 +376,9 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	var signalChannel = make(chan os.Signal, 1)
+	signalChannel := make(chan os.Signal, 1)
 
-	var stopChannels = make([]chan bool, len(configuration.Providers))
+	stopChannels := make([]chan bool, len(configuration.Providers))
 
 	for idx, conf := range configuration.Providers {
 		stop := make(chan bool, 1)
