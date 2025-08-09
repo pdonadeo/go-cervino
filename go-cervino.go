@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -39,7 +41,7 @@ type OAuth2Config struct {
 	TokenURL      string   `yaml:"token_url"`
 	AuthURL       string   `yaml:"auth_url"`
 	RedirectURI   string   `yaml:"redirect_uri"`    // opzionale; se presente, il listener usa host:porta indicati
-	DeviceCodeURL string   `yaml:"device_code_url"` // opzionale; per device authorization flow
+	DeviceCodeURL string   `yaml:"device_code_url"` // opzionale: device authorization flow
 	Scope         []string `yaml:"scope"`
 }
 
@@ -155,24 +157,15 @@ func printMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages 
 
 func printMailboxStatus(log *zap.SugaredLogger, msg string, conf ProviderConfiguration, mboxStatus *imap.MailboxStatus) {
 	log.Debugf("%s: %s", conf.Label, msg)
-	log.Debugf("%s: Mailbox update: %d messages, %d recent, %d unseen, %d unseenSeqNum",
-		conf.Label, mboxStatus.Messages, mboxStatus.Recent, mboxStatus.Unseen, mboxStatus.UnseenSeqNum)
+	log.Debugf("%s: Mailbox update: %d messages, %d recent, %d unseen, %d unseenSeqNum", conf.Label, mboxStatus.Messages, mboxStatus.Recent, mboxStatus.Unseen, mboxStatus.UnseenSeqNum)
 }
 
-func updateMessagesMap(
-	log *zap.SugaredLogger,
-	conf ProviderConfiguration,
-	mboxMap map[uint32]imap.Message,
-	mboxStatus *imap.MailboxStatus,
-	c *client.Client,
-	alsoNewMessages bool,
-) (map[uint32]imap.Message, error) {
+func updateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration, mboxMap map[uint32]imap.Message, mboxStatus *imap.MailboxStatus, c *client.Client, alsoNewMessages bool) (map[uint32]imap.Message, error) {
 	printMailboxStatus(log, "UpdateMessageMap", conf, mboxStatus)
 	if mboxStatus.Messages == 0 {
 		log.Debugf("%s: UpdateMessageMap: mboxStatus.Messages == 0", conf.Label)
 		return mboxMap, nil
 	}
-
 	var from uint32
 	if alsoNewMessages {
 		from = 1
@@ -185,14 +178,11 @@ func updateMessagesMap(
 	}
 	to := mboxStatus.Messages
 	log.Debugf("%s: UpdateMessageMap: from=%d to=%d", conf.Label, from, to)
-
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, to)
-
 	messages := make(chan *imap.Message, 10)
 	done := make(chan error, 1)
 	go func() { done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchAll}, messages) }()
-
 	for msg := range messages {
 		if msg == nil {
 			continue
@@ -262,6 +252,24 @@ func expunge(log *zap.SugaredLogger, conf ProviderConfiguration, mboxMap map[uin
 	return newMboxMap
 }
 
+// ===== OAuth2 helpers =====
+func b64url(b []byte) string {
+	return strings.TrimRight(base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b), "=")
+}
+
+func genCodeVerifier() (string, error) {
+	r := make([]byte, 64)
+	if _, err := rand.Read(r); err != nil {
+		return "", err
+	}
+	return b64url(r), nil
+}
+
+func codeChallengeS256(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return b64url(sum[:])
+}
+
 // getAccessTokenFromRefreshToken: ottiene access token da refresh token.
 func getAccessTokenFromRefreshToken(ctx context.Context, oauth *OAuth2Config) (string, time.Time, error) {
 	if oauth.TokenURL == "" {
@@ -307,19 +315,21 @@ func getAccessTokenFromRefreshToken(ctx context.Context, oauth *OAuth2Config) (s
 	return tokenResp.AccessToken, expiry, nil
 }
 
-// fetchAccessToken: cache + refresh.
-func fetchAccessToken(ctx context.Context, label string, username string, oauth *OAuth2Config) (string, error) {
-	cacheKey := oauth.TokenURL + "|" + username + "|" + label
-	// carica refresh token da store se mancante
+// fetchAccessToken: cache + refresh + migrazione chiave legacy
+func fetchAccessToken(ctx context.Context, label, username string, oauth *OAuth2Config) (string, error) {
+	primaryKey := oauth.TokenURL + "|" + username + "|" + label
+	legacyKey := oauth.TokenURL + "||" + label
 	if oauth.RefreshToken == "" {
 		if store, err := loadTokenStore(); err == nil {
-			if v, ok := store[cacheKey]; ok {
+			if v, ok := store[primaryKey]; ok {
+				oauth.RefreshToken = v
+			} else if v, ok := store[legacyKey]; ok {
 				oauth.RefreshToken = v
 			}
 		}
 	}
 	tokenCache.Lock()
-	item, ok := tokenCache.m[cacheKey]
+	item, ok := tokenCache.m[primaryKey]
 	tokenCache.Unlock()
 	const margin = 60 * time.Second
 	if ok && time.Now().Add(margin).Before(item.Expiry) && item.AccessToken != "" {
@@ -333,7 +343,7 @@ func fetchAccessToken(ctx context.Context, label string, username string, oauth 
 		return "", err
 	}
 	tokenCache.Lock()
-	tokenCache.m[cacheKey] = tokenCacheItem{AccessToken: accessToken, Expiry: expiry}
+	tokenCache.m[primaryKey] = tokenCacheItem{AccessToken: accessToken, Expiry: expiry}
 	tokenCache.Unlock()
 	return accessToken, nil
 }
@@ -355,7 +365,7 @@ func (c *xoauth2Client) Start() (string, []byte, error) {
 }
 func (c *xoauth2Client) Next(challenge []byte) ([]byte, error) { return nil, nil }
 
-// IMAP trace redaction: evita di stampare il bearer token in chiaro
+// IMAP trace redaction
 type redactingWriter struct{ dst io.Writer }
 
 func (w redactingWriter) Write(p []byte) (int, error) {
@@ -368,33 +378,27 @@ func (w redactingWriter) Write(p []byte) (int, error) {
 
 func redactBearer(s string) string {
 	if i := strings.Index(s, "Bearer "); i != -1 {
-		// preserva solo i primi byte per capire che il token c'è
 		prefix := s[:i+7]
 		rest := s[i+7:]
 		if j := strings.Index(rest, "\r\n"); j != -1 {
 			rest = rest[:j]
 		}
-		// mostra solo i primi 8 caratteri
-		shown := rest
-		if len(shown) > 8 {
-			shown = shown[:8]
+		if len(rest) > 8 {
+			rest = rest[:8]
 		}
-		return prefix + shown + "… [REDACTED]\r\n"
+		return prefix + rest + "… [REDACTED]\r\n"
 	}
 	return s
 }
 
 func enableIMAPTrace(c *client.Client, log *zap.SugaredLogger) {
-	// La maggior parte delle versioni di go-imap espone SetDebug(io.Writer)
 	if setter, ok := interface{}(c).(interface{ SetDebug(w io.Writer) }); ok {
 		setter.SetDebug(redactingWriter{dst: os.Stderr})
 		log.Infof("IMAP trace attivato (token redatti)")
-	} else {
-		log.Infof("IMAP trace non disponibile in questa versione di go-imap")
 	}
 }
 
-// Decodifica sicura (senza verifica) del payload JWT per loggare campi utili (aud, scp)
+// Decodifica (senza verifica) del payload JWT per loggare aud/scp
 func logTokenClaims(log *zap.SugaredLogger, accessToken string) {
 	parts := strings.Split(accessToken, ".")
 	if len(parts) < 2 {
@@ -442,6 +446,12 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		}
 		log.Debugf("...%s connected", conf.Label)
 		if conf.OAuth2 != nil {
+			if strings.TrimSpace(conf.Username) == "" {
+				log.Errorf("%s: username mancante: XOAUTH2 richiede l'indirizzo email completo (es. user@domain)", conf.Label)
+				_ = c.Logout()
+				time.Sleep(5 * time.Second)
+				continue
+			}
 			tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			token, err := fetchAccessToken(tctx, conf.Label, conf.Username, conf.OAuth2)
 			cancel()
@@ -454,10 +464,11 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			if globalDebugTokens {
 				logTokenClaims(log, token)
 			}
+			log.Debugf("%s: XOAUTH2 user=%q (token redatto)", conf.Label, conf.Username)
 			auth := NewXOAuth2(conf.Username, token)
 			if err := c.Authenticate(auth); err != nil {
 				log.Errorf("%s: OAuth2 auth failed: %v", conf.Label, err)
-				log.Infof("Suggerimento: avvia con --imap-trace per vedere il dialogo IMAP (se supportato) con token redatti.")
+				log.Infof("Suggerimento: avvia con --imap-trace per vedere il dialogo IMAP (token redatti).")
 				_ = c.Logout()
 				time.Sleep(5 * time.Second)
 				cacheKey := conf.OAuth2.TokenURL + "|" + conf.Username + "|" + conf.Label
@@ -565,7 +576,7 @@ func openBrowser(url string) error {
 	}
 }
 
-// Authorization Code Flow con listener locale allineato alla redirect_uri (se fornita)
+// Authorization Code Flow con listener locale + PKCE quando client_secret è vuoto
 func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 	if conf.OAuth2 == nil {
 		return fmt.Errorf("no oauth2 configuration")
@@ -603,10 +614,7 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 		if u.Path != "" {
 			cbPath = u.Path
 		}
-	} else {
-		redirectURI = ""
 	}
-
 	addr := fmt.Sprintf("%s:%d", listenerHost, listenerPort)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -627,8 +635,18 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 	}
 	q.Set("access_type", "offline")
 	q.Set("prompt", "consent")
+	usePKCE := oauth.ClientSecret == ""
+	var codeVerifier string
+	if usePKCE {
+		var err error
+		codeVerifier, err = genCodeVerifier()
+		if err != nil {
+			return fmt.Errorf("cannot generate PKCE verifier: %w", err)
+		}
+		q.Set("code_challenge", codeChallengeS256(codeVerifier))
+		q.Set("code_challenge_method", "S256")
+	}
 	authURL := oauth.AuthURL + "?" + q.Encode()
-
 	mux := http.NewServeMux()
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
@@ -657,7 +675,6 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 		default:
 		}
 	})
-
 	server := &http.Server{Handler: mux}
 	go func() {
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -667,13 +684,11 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 			}
 		}
 	}()
-
 	fmt.Printf("Apri nel browser la seguente URL e concedi l'accesso:\n%s\n", authURL)
 	fmt.Printf("Se possibile, verrai reindirizzato a %s\n", redirectURI)
 	if autoOpen {
 		_ = openBrowser(authURL)
 	}
-
 	select {
 	case code := <-codeCh:
 		_ = server.Shutdown(context.Background())
@@ -682,7 +697,9 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 		form.Set("code", code)
 		form.Set("redirect_uri", redirectURI)
 		form.Set("client_id", oauth.ClientID)
-		if oauth.ClientSecret != "" {
+		if usePKCE {
+			form.Set("code_verifier", codeVerifier)
+		} else if oauth.ClientSecret != "" {
 			form.Set("client_secret", oauth.ClientSecret)
 		}
 		req, err := http.NewRequest("POST", oauth.TokenURL, strings.NewReader(form.Encode()))
@@ -714,7 +731,10 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 			return err
 		}
 		if tr.RefreshToken != "" {
-			store[cacheKey] = tr.RefreshToken
+			store[cacheKey] = tr.RefreshToken // rimuovi eventuale legacy key
+			if _, ok := store[oauth.TokenURL+"||"+conf.Label]; ok {
+				delete(store, oauth.TokenURL+"||"+conf.Label)
+			}
 			if err := saveTokenStore(store); err != nil {
 				return err
 			}
@@ -801,6 +821,9 @@ func runOAuth2DeviceFlow(conf ProviderConfiguration) error {
 			}
 			if tr.RefreshToken != "" {
 				store[cacheKey] = tr.RefreshToken
+				if _, ok := store[oauth.TokenURL+"||"+conf.Label]; ok {
+					delete(store, oauth.TokenURL+"||"+conf.Label)
+				}
 				if err := saveTokenStore(store); err != nil {
 					return err
 				}
@@ -838,7 +861,6 @@ func main() {
 		}
 	}()
 	log := logger.Sugar()
-
 	var configuration Configuration
 	var confFile string
 	var debug bool
@@ -847,7 +869,6 @@ func main() {
 	var openAuthURL bool
 	var imapTrace bool
 	var debugTokens bool
-
 	flag.StringVar(&confFile, "c", "config.yaml", "Configuration file")
 	flag.StringVar(&confFile, "configuration", "config.yaml", "Configuration file")
 	flag.BoolVar(&debug, "d", false, "Debug mode")
@@ -857,14 +878,12 @@ func main() {
 	flag.BoolVar(&imapTrace, "imap-trace", false, "Stampa il dialogo IMAP (token redatti)")
 	flag.BoolVar(&debugTokens, "debug-tokens", false, "Logga aud/scp dei JWT ottenuti")
 	flag.Parse()
-
 	if debug {
 		level.SetLevel(zap.DebugLevel)
 	}
 	globalIMAPTrace = imapTrace
 	globalDebugTokens = debugTokens
 	log.Infof("Starting %s", appName)
-
 	data, err := os.ReadFile(confFile)
 	if err != nil {
 		log.Fatalf("Error reading configuration file: %s", err)
@@ -872,7 +891,6 @@ func main() {
 	if err = yaml.Unmarshal(data, &configuration); err != nil {
 		log.Fatalf("Error parsing configuration file: %s", err)
 	}
-
 	if doLogin || doLoginDevice {
 		for _, conf := range configuration.Providers {
 			if conf.OAuth2 != nil {
@@ -902,7 +920,6 @@ func main() {
 		}
 		return
 	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	var wg sync.WaitGroup
