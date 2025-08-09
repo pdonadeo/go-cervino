@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -60,6 +61,12 @@ type Configuration struct {
 }
 
 var appName = "go-cervino"
+
+// debug flags set from main
+var (
+	globalIMAPTrace   bool
+	globalDebugTokens bool
+)
 
 // tokenCacheItem mantiene un access token e la scadenza.
 type tokenCacheItem struct {
@@ -184,9 +191,7 @@ func updateMessagesMap(
 
 	messages := make(chan *imap.Message, 10)
 	done := make(chan error, 1)
-	go func() {
-		done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchAll}, messages)
-	}()
+	go func() { done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchAll}, messages) }()
 
 	for msg := range messages {
 		if msg == nil {
@@ -194,7 +199,6 @@ func updateMessagesMap(
 		}
 		if _, exists := mboxMap[msg.SeqNum]; !exists {
 			mboxMap[msg.SeqNum] = *msg
-
 			isRecent := false
 			for _, f := range msg.Flags {
 				if f == imap.RecentFlag {
@@ -202,7 +206,6 @@ func updateMessagesMap(
 					break
 				}
 			}
-
 			isNew := true
 			for _, f := range msg.Flags {
 				if f == imap.SeenFlag {
@@ -210,15 +213,12 @@ func updateMessagesMap(
 					break
 				}
 			}
-
 			if (alsoNewMessages && isNew) || isRecent {
 				fromName := ""
 				if len(msg.Envelope.From) > 0 {
 					fromName = msg.Envelope.From[0].PersonalName
 				}
-				ntf := notify.NewNotification(
-					"New email in "+conf.Label,
-					fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, fromName))
+				ntf := notify.NewNotification("New email in "+conf.Label, fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, fromName))
 				ntf.AppName = appName
 				if conf.Icon == "" {
 					ntf.AppIcon = "mail-unread"
@@ -238,24 +238,16 @@ func updateMessagesMap(
 			}
 		}
 	}
-
 	if err := <-done; err != nil {
 		return nil, err
 	}
-
 	printMessages(log, conf, mboxMap)
 	return mboxMap, nil
 }
 
-func expunge(
-	log *zap.SugaredLogger,
-	conf ProviderConfiguration,
-	mboxMap map[uint32]imap.Message,
-	seqNum uint32,
-) map[uint32]imap.Message {
+func expunge(log *zap.SugaredLogger, conf ProviderConfiguration, mboxMap map[uint32]imap.Message, seqNum uint32) map[uint32]imap.Message {
 	k := keys(mboxMap)
 	sort.Slice(k, func(i, j int) bool { return k[i] < k[j] })
-
 	newMboxMap := make(map[uint32]imap.Message)
 	newSeqNum := uint32(1)
 	for _, key := range k {
@@ -320,8 +312,7 @@ func fetchAccessToken(ctx context.Context, label string, username string, oauth 
 	cacheKey := oauth.TokenURL + "|" + username + "|" + label
 	// carica refresh token da store se mancante
 	if oauth.RefreshToken == "" {
-		store, err := loadTokenStore()
-		if err == nil {
+		if store, err := loadTokenStore(); err == nil {
 			if v, ok := store[cacheKey]; ok {
 				oauth.RefreshToken = v
 			}
@@ -364,6 +355,72 @@ func (c *xoauth2Client) Start() (string, []byte, error) {
 }
 func (c *xoauth2Client) Next(challenge []byte) ([]byte, error) { return nil, nil }
 
+// IMAP trace redaction: evita di stampare il bearer token in chiaro
+type redactingWriter struct{ dst io.Writer }
+
+func (w redactingWriter) Write(p []byte) (int, error) {
+	line := string(p)
+	if strings.Contains(line, "AUTHENTICATE XOAUTH2") || strings.Contains(line, "Bearer ") {
+		line = redactBearer(line)
+	}
+	return w.dst.Write([]byte(line))
+}
+
+func redactBearer(s string) string {
+	if i := strings.Index(s, "Bearer "); i != -1 {
+		// preserva solo i primi byte per capire che il token c'è
+		prefix := s[:i+7]
+		rest := s[i+7:]
+		if j := strings.Index(rest, "\r\n"); j != -1 {
+			rest = rest[:j]
+		}
+		// mostra solo i primi 8 caratteri
+		shown := rest
+		if len(shown) > 8 {
+			shown = shown[:8]
+		}
+		return prefix + shown + "… [REDACTED]\r\n"
+	}
+	return s
+}
+
+func enableIMAPTrace(c *client.Client, log *zap.SugaredLogger) {
+	// La maggior parte delle versioni di go-imap espone SetDebug(io.Writer)
+	if setter, ok := interface{}(c).(interface{ SetDebug(w io.Writer) }); ok {
+		setter.SetDebug(redactingWriter{dst: os.Stderr})
+		log.Infof("IMAP trace attivato (token redatti)")
+	} else {
+		log.Infof("IMAP trace non disponibile in questa versione di go-imap")
+	}
+}
+
+// Decodifica sicura (senza verifica) del payload JWT per loggare campi utili (aud, scp)
+func logTokenClaims(log *zap.SugaredLogger, accessToken string) {
+	parts := strings.Split(accessToken, ".")
+	if len(parts) < 2 {
+		log.Debug("token non sembra un JWT")
+		return
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		log.Debugf("impossibile decodificare payload JWT: %v", err)
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(payload, &m); err != nil {
+		log.Debugf("payload JWT non JSON: %v", err)
+		return
+	}
+	aud, _ := m["aud"].(string)
+	scp, _ := m["scp"].(string)
+	app, _ := m["appid"].(string)
+	upn, _ := m["upn"].(string)
+	if upn == "" {
+		upn, _ = m["preferred_username"].(string)
+	}
+	log.Debugf("JWT aud=%q scp=%q appid=%q user=%q", aud, scp, app, upn)
+}
+
 func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration) {
 	keepAlive := 5 * time.Minute
 	for {
@@ -380,6 +437,9 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			time.Sleep(5 * time.Second)
 			continue
 		}
+		if globalIMAPTrace {
+			enableIMAPTrace(c, log)
+		}
 		log.Debugf("...%s connected", conf.Label)
 		if conf.OAuth2 != nil {
 			tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -391,9 +451,13 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 				time.Sleep(5 * time.Second)
 				continue
 			}
+			if globalDebugTokens {
+				logTokenClaims(log, token)
+			}
 			auth := NewXOAuth2(conf.Username, token)
 			if err := c.Authenticate(auth); err != nil {
 				log.Errorf("%s: OAuth2 auth failed: %v", conf.Label, err)
+				log.Infof("Suggerimento: avvia con --imap-trace per vedere il dialogo IMAP (se supportato) con token redatti.")
 				_ = c.Logout()
 				time.Sleep(5 * time.Second)
 				cacheKey := conf.OAuth2.TokenURL + "|" + conf.Username + "|" + conf.Label
@@ -781,6 +845,8 @@ func main() {
 	var doLogin bool
 	var doLoginDevice bool
 	var openAuthURL bool
+	var imapTrace bool
+	var debugTokens bool
 
 	flag.StringVar(&confFile, "c", "config.yaml", "Configuration file")
 	flag.StringVar(&confFile, "configuration", "config.yaml", "Configuration file")
@@ -788,11 +854,15 @@ func main() {
 	flag.BoolVar(&doLogin, "login", false, "Esegui login interattivo (authorization code) per tutti i provider e esci")
 	flag.BoolVar(&doLoginDevice, "login-device", false, "Esegui login interattivo (device code flow) per tutti i provider e esci")
 	flag.BoolVar(&openAuthURL, "open-browser", false, "Prova ad aprire automaticamente il browser durante il login")
+	flag.BoolVar(&imapTrace, "imap-trace", false, "Stampa il dialogo IMAP (token redatti)")
+	flag.BoolVar(&debugTokens, "debug-tokens", false, "Logga aud/scp dei JWT ottenuti")
 	flag.Parse()
 
 	if debug {
 		level.SetLevel(zap.DebugLevel)
 	}
+	globalIMAPTrace = imapTrace
+	globalDebugTokens = debugTokens
 	log.Infof("Starting %s", appName)
 
 	data, err := os.ReadFile(confFile)
