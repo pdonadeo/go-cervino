@@ -6,10 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -25,12 +27,15 @@ import (
 )
 
 // OAuth2Config contiene i campi necessari per ottenere access token da refresh token.
+// Ho aggiunto AuthURL e (opzionalmente) RedirectURI per gestire il flusso di authorization code.
 type OAuth2Config struct {
-	ClientID     string `yaml:"client_id"`
-	ClientSecret string `yaml:"client_secret"`
-	RefreshToken string `yaml:"refresh_token"`
-	TokenURL     string `yaml:"token_url"`
-	Scope        string `yaml:"scope"`
+	ClientID     string   `yaml:"client_id"`
+	ClientSecret string   `yaml:"client_secret"`
+	RefreshToken string   `yaml:"refresh_token"`
+	TokenURL     string   `yaml:"token_url"`
+	AuthURL      string   `yaml:"auth_url"`
+	RedirectURI  string   `yaml:"redirect_uri"` // opzionale, se vuoto useremo localhost con porta dinamica
+	Scope        []string `yaml:"scope"`
 }
 
 type ProviderConfiguration struct {
@@ -63,6 +68,50 @@ var tokenCache = struct {
 	sync.Mutex
 	m map[string]tokenCacheItem
 }{m: make(map[string]tokenCacheItem)}
+
+// token store su disco: salviamo solo refresh_token per provider/user/token_url
+// percorso: $XDG_CONFIG_HOME/go-cervino/oauth_tokens.json oppure ~/.config/go-cervino/oauth_tokens.json
+func tokenStorePath() string {
+	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		return filepath.Join(x, "go-cervino", "oauth_tokens.json")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "go-cervino", "oauth_tokens.json")
+}
+
+func loadTokenStore() (map[string]string, error) {
+	p := tokenStorePath()
+	f, err := os.Open(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]string{}, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	m := map[string]string{}
+	dec := json.NewDecoder(f)
+	if err := dec.Decode(&m); err != nil && err != io.EOF {
+		return nil, err
+	}
+	return m, nil
+}
+
+func saveTokenStore(m map[string]string) error {
+	p := tokenStorePath()
+	d := filepath.Dir(p)
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		return err
+	}
+	f, err := os.Create(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(m)
+}
 
 func keys[K comparable, V any](m map[K]V) []K {
 	out := make([]K, 0, len(m))
@@ -229,8 +278,8 @@ func getAccessTokenFromRefreshToken(ctx context.Context, oauth *OAuth2Config) (s
 	form.Set("client_secret", oauth.ClientSecret)
 	form.Set("refresh_token", oauth.RefreshToken)
 	form.Set("grant_type", "refresh_token")
-	if oauth.Scope != "" {
-		form.Set("scope", oauth.Scope)
+	if len(oauth.Scope) > 0 {
+		form.Set("scope", strings.Join(oauth.Scope, " "))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", oauth.TokenURL, strings.NewReader(form.Encode()))
@@ -275,6 +324,16 @@ func getAccessTokenFromRefreshToken(ctx context.Context, oauth *OAuth2Config) (s
 func fetchAccessToken(ctx context.Context, label string, username string, oauth *OAuth2Config) (string, error) {
 	cacheKey := oauth.TokenURL + "|" + username + "|" + label
 
+	// se manca refresh token nella struct, proviamo a caricarlo dallo store su disco
+	if oauth.RefreshToken == "" {
+		store, err := loadTokenStore()
+		if err == nil {
+			if v, ok := store[cacheKey]; ok {
+				oauth.RefreshToken = v
+			}
+		}
+	}
+
 	tokenCache.Lock()
 	item, ok := tokenCache.m[cacheKey]
 	tokenCache.Unlock()
@@ -283,6 +342,10 @@ func fetchAccessToken(ctx context.Context, label string, username string, oauth 
 
 	if ok && time.Now().Add(margin).Before(item.Expiry) && item.AccessToken != "" {
 		return item.AccessToken, nil
+	}
+
+	if oauth.RefreshToken == "" {
+		return "", fmt.Errorf("no refresh token available for provider %s user %s", label, username)
 	}
 
 	accessToken, expiry, err := getAccessTokenFromRefreshToken(ctx, oauth)
@@ -456,6 +519,176 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 	}
 }
 
+// tryPasswordLogin tenta una connessione IMAP e login con username/password (senza loop)
+func tryPasswordLogin(conf ProviderConfiguration) error {
+	addr := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
+	c, err := client.DialTLS(addr, nil)
+	if err != nil {
+		return err
+	}
+	defer c.Logout()
+	return c.Login(conf.Username, conf.Password)
+}
+
+// runOAuth2Flow esegue un authorization code flow minimale con redirect su localhost:porta dinamica
+// stampa la URL da aprire e attende il codice. Salva il refresh_token nello store su disco.
+func runOAuth2Flow(conf ProviderConfiguration) error {
+	if conf.OAuth2 == nil {
+		return fmt.Errorf("no oauth2 configuration")
+	}
+	oauth := conf.OAuth2
+	if oauth.ClientID == "" || oauth.ClientSecret == "" || oauth.AuthURL == "" || oauth.TokenURL == "" {
+		return fmt.Errorf("oauth2 configuration incomplete: client_id, client_secret, auth_url and token_url are required")
+	}
+
+	// apriamo listener su porta libera
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("cannot open listener: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	redirectURI := oauth.RedirectURI
+	if redirectURI == "" {
+		redirectURI = fmt.Sprintf("http://localhost:%d/callback", port)
+	}
+
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("client_id", oauth.ClientID)
+	q.Set("redirect_uri", redirectURI)
+	if oauth.Scope != nil && len(oauth.Scope) > 0 {
+		q.Set("scope", strings.Join(oauth.Scope, " "))
+	}
+	// alcuni provider richiedono parametri aggiuntivi per ottenere refresh token
+	q.Set("access_type", "offline")
+	q.Set("prompt", "consent")
+
+	authURL := oauth.AuthURL + "?" + q.Encode()
+
+	fmt.Printf("Apri nel browser la seguente URL e concedi l'accesso:\n%s\n", authURL)
+	fmt.Printf("Se possibile, verrai reindirizzato a %s\n", redirectURI)
+
+	codeCh := make(chan string)
+	errCh := make(chan error)
+
+	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		vals := r.URL.Query()
+		if err := vals.Get("error"); err != "" {
+			http.Error(w, "authorization error: "+err, http.StatusBadRequest)
+			select {
+			case errCh <- fmt.Errorf("authorization error: %s", err):
+			default:
+			}
+			return
+		}
+		code := vals.Get("code")
+		if code == "" {
+			http.Error(w, "no code in request", http.StatusBadRequest)
+			select {
+			case errCh <- fmt.Errorf("no code in request"):
+			default:
+			}
+			return
+		}
+		io.WriteString(w, "Autenticazione completata. Puoi chiudere questa finestra e tornare al terminale.\n")
+		select {
+		case codeCh <- code:
+		default:
+		}
+	})
+
+	server := &http.Server{}
+	go func() {
+		// serve using existing listener (so we don't conflict with other services)
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			select {
+			case errCh <- err:
+			default:
+			}
+		}
+	}()
+
+	// aspettiamo codice o errore con timeout
+	select {
+	case code := <-codeCh:
+		// prosegui
+		_ = server.Shutdown(context.Background())
+		// scambiamo il codice per token
+		form := url.Values{}
+		form.Set("grant_type", "authorization_code")
+		form.Set("code", code)
+		form.Set("redirect_uri", redirectURI)
+		form.Set("client_id", oauth.ClientID)
+		form.Set("client_secret", oauth.ClientSecret)
+
+		req, err := http.NewRequest("POST", oauth.TokenURL, strings.NewReader(form.Encode()))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		hc := &http.Client{Timeout: 15 * time.Second}
+		resp, err := hc.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			b, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, string(b))
+		}
+
+		var tr struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int64  `json:"expires_in"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+			return err
+		}
+
+		if tr.RefreshToken == "" {
+			fmt.Printf("Attenzione: il token endpoint non ha restituito refresh_token. Potrebbe essere necessario richiedere scope aggiuntivi (es. offline_access) o prompt/consent speciali.\n")
+		}
+
+		// salva refresh token nello store su disco
+		cacheKey := oauth.TokenURL + "|" + conf.Username + "|" + conf.Label
+		store, err := loadTokenStore()
+		if err != nil {
+			return err
+		}
+		if tr.RefreshToken != "" {
+			store[cacheKey] = tr.RefreshToken
+			if err := saveTokenStore(store); err != nil {
+				return err
+			}
+			fmt.Printf("Refresh token salvato nello store (%s).\n", tokenStorePath())
+		} else if oauth.RefreshToken != "" {
+			// niente da fare, già presente nella config
+			fmt.Printf("Refresh token presente nella configurazione iniziale; nessuna modifica effettuata.\n")
+		} else {
+			fmt.Printf("Nessun refresh token disponibile per il salvataggio.\n")
+		}
+
+		// memorizziamo anche nella struct in memoria per coerenza
+		if tr.RefreshToken != "" {
+			oauth.RefreshToken = tr.RefreshToken
+		}
+
+		_ = resp.Body.Close()
+		_ = server.Close()
+		return nil
+
+	case err := <-errCh:
+		_ = server.Close()
+		return err
+	case <-time.After(5 * time.Minute):
+		_ = server.Close()
+		return fmt.Errorf("timeout waiting for authorization code")
+	}
+}
+
 func main() {
 	config := zap.NewDevelopmentConfig()
 	level := zap.NewAtomicLevel()
@@ -474,10 +707,12 @@ func main() {
 	var configuration Configuration
 	var confFile string
 	var debug bool
+	var doLogin bool
 
 	flag.StringVar(&confFile, "c", "config.yaml", "Configuration file")
 	flag.StringVar(&confFile, "configuration", "config.yaml", "Configuration file")
 	flag.BoolVar(&debug, "d", false, "Debug mode")
+	flag.BoolVar(&doLogin, "login", false, "Esegui login interattivo per tutti i provider e esci")
 	flag.Parse()
 
 	if debug {
@@ -493,6 +728,28 @@ func main() {
 
 	if err = yaml.Unmarshal(data, &configuration); err != nil {
 		log.Fatalf("Error parsing configuration file: %s", err)
+	}
+
+	if doLogin {
+		// Esegui login test / oauth flow per ogni provider e poi esci
+		for _, conf := range configuration.Providers {
+			if conf.OAuth2 != nil {
+				log.Infof("%s: avvio flusso OAuth2...", conf.Label)
+				if err := runOAuth2Flow(conf); err != nil {
+					log.Errorf("%s: OAuth2 login failed: %v", conf.Label, err)
+				} else {
+					log.Infof("%s: OAuth2 login completed", conf.Label)
+				}
+			} else {
+				log.Infof("%s: test login username/password...", conf.Label)
+				if err := tryPasswordLogin(conf); err != nil {
+					log.Errorf("%s: login failed: %v", conf.Label, err)
+				} else {
+					log.Infof("%s: password login successful", conf.Label)
+				}
+			}
+		}
+		return
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
