@@ -92,7 +92,7 @@ func tokenStorePath() string {
 	return filepath.Join(home, ".config", "go-cervino", "oauth_tokens.json")
 }
 
-func loadTokenStore() (map[string]string, error) {
+func loadTokenStore(log *zap.SugaredLogger) (map[string]string, error) {
 	p := tokenStorePath()
 	f, err := os.Open(p)
 	if err != nil {
@@ -101,7 +101,14 @@ func loadTokenStore() (map[string]string, error) {
 		}
 		return nil, err
 	}
-	defer f.Close()
+
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			log.Errorf("Error closing token store file: %s", err)
+		}
+	}()
+
 	m := map[string]string{}
 	dec := json.NewDecoder(f)
 	if err := dec.Decode(&m); err != nil && err != io.EOF {
@@ -110,7 +117,7 @@ func loadTokenStore() (map[string]string, error) {
 	return m, nil
 }
 
-func saveTokenStore(m map[string]string) error {
+func saveTokenStore(log *zap.SugaredLogger, m map[string]string) error {
 	p := tokenStorePath()
 	d := filepath.Dir(p)
 	if err := os.MkdirAll(d, 0o700); err != nil {
@@ -120,7 +127,14 @@ func saveTokenStore(m map[string]string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			log.Errorf("Error closing token store file: %s", err)
+		}
+	}()
+
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(m)
@@ -271,7 +285,7 @@ func codeChallengeS256(verifier string) string {
 }
 
 // getAccessTokenFromRefreshToken: ottiene access token da refresh token.
-func getAccessTokenFromRefreshToken(ctx context.Context, oauth *OAuth2Config) (string, time.Time, error) {
+func getAccessTokenFromRefreshToken(ctx context.Context, log *zap.SugaredLogger, oauth *OAuth2Config) (string, time.Time, error) {
 	if oauth.TokenURL == "" {
 		return "", time.Time{}, fmt.Errorf("token_url non impostato in configurazione OAuth2")
 	}
@@ -295,7 +309,11 @@ func getAccessTokenFromRefreshToken(ctx context.Context, oauth *OAuth2Config) (s
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Errorf("Error closing response body: %s", err)
+		}
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		return "", time.Time{}, fmt.Errorf("token endpoint returned status %d: %s", resp.StatusCode, string(body))
@@ -316,11 +334,11 @@ func getAccessTokenFromRefreshToken(ctx context.Context, oauth *OAuth2Config) (s
 }
 
 // fetchAccessToken: cache + refresh + migrazione chiave legacy
-func fetchAccessToken(ctx context.Context, label, username string, oauth *OAuth2Config) (string, error) {
+func fetchAccessToken(ctx context.Context, log *zap.SugaredLogger, label, username string, oauth *OAuth2Config) (string, error) {
 	primaryKey := oauth.TokenURL + "|" + username + "|" + label
 	legacyKey := oauth.TokenURL + "||" + label
 	if oauth.RefreshToken == "" {
-		if store, err := loadTokenStore(); err == nil {
+		if store, err := loadTokenStore(log); err == nil {
 			if v, ok := store[primaryKey]; ok {
 				oauth.RefreshToken = v
 			} else if v, ok := store[legacyKey]; ok {
@@ -338,7 +356,7 @@ func fetchAccessToken(ctx context.Context, label, username string, oauth *OAuth2
 	if oauth.RefreshToken == "" {
 		return "", fmt.Errorf("no refresh token available for provider %s user %s", label, username)
 	}
-	accessToken, expiry, err := getAccessTokenFromRefreshToken(ctx, oauth)
+	accessToken, expiry, err := getAccessTokenFromRefreshToken(ctx, log, oauth)
 	if err != nil {
 		return "", err
 	}
@@ -453,7 +471,8 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 				continue
 			}
 			tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			token, err := fetchAccessToken(tctx, conf.Label, conf.Username, conf.OAuth2)
+			var token string
+			token, err = fetchAccessToken(tctx, log, conf.Label, conf.Username, conf.OAuth2)
 			cancel()
 			if err != nil {
 				log.Errorf("%s: cannot get OAuth2 token: %v", conf.Label, err)
@@ -466,7 +485,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			}
 			log.Debugf("%s: XOAUTH2 user=%q (token redatto)", conf.Label, conf.Username)
 			auth := NewXOAuth2(conf.Username, token)
-			if err := c.Authenticate(auth); err != nil {
+			if err = c.Authenticate(auth); err != nil {
 				log.Errorf("%s: OAuth2 auth failed: %v", conf.Label, err)
 				log.Infof("Suggerimento: avvia con --imap-trace per vedere il dialogo IMAP (token redatti).")
 				_ = c.Logout()
@@ -478,7 +497,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 				continue
 			}
 		} else {
-			if err := c.Login(conf.Username, conf.Password); err != nil {
+			if err = c.Login(conf.Username, conf.Password); err != nil {
 				log.Errorf("%s: login error: %v", conf.Label, err)
 				_ = c.Logout()
 				time.Sleep(5 * time.Second)
@@ -552,13 +571,17 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 }
 
 // tryPasswordLogin: test di login utente/password.
-func tryPasswordLogin(conf ProviderConfiguration) error {
+func tryPasswordLogin(conf ProviderConfiguration, log *zap.SugaredLogger) error {
 	addr := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
 	c, err := client.DialTLS(addr, nil)
 	if err != nil {
 		return err
 	}
-	defer c.Logout()
+	defer func() {
+		if err := c.Logout(); err != nil {
+			log.Errorf("Error logging out: %s", err)
+		}
+	}()
 	return c.Login(conf.Username, conf.Password)
 }
 
@@ -577,7 +600,7 @@ func openBrowser(url string) error {
 }
 
 // Authorization Code Flow con listener locale + PKCE quando client_secret è vuoto
-func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
+func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen bool) error {
 	if conf.OAuth2 == nil {
 		return fmt.Errorf("no oauth2 configuration")
 	}
@@ -620,7 +643,11 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 	if err != nil {
 		return fmt.Errorf("cannot open listener on %s: %v", addr, err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			log.Errorf("Error closing listener: %s", err)
+		}
+	}()
 	if redirectURI == "" {
 		port := ln.Addr().(*net.TCPAddr).Port
 		redirectURI = fmt.Sprintf("http://127.0.0.1:%d%s", port, cbPath)
@@ -669,7 +696,7 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 			}
 			return
 		}
-		io.WriteString(w, "Autenticazione completata. Puoi chiudere questa finestra e tornare al terminale.\n")
+		_, _ = io.WriteString(w, "Autenticazione completata. Puoi chiudere questa finestra e tornare al terminale.\n")
 		select {
 		case codeCh <- code:
 		default:
@@ -712,7 +739,11 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if err = resp.Body.Close(); err != nil {
+				log.Errorf("Error closing response body: %s", err)
+			}
+		}()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			b, _ := io.ReadAll(resp.Body)
 			return fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, string(b))
@@ -722,20 +753,18 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 			RefreshToken string `json:"refresh_token"`
 			ExpiresIn    int64  `json:"expires_in"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		if err = json.NewDecoder(resp.Body).Decode(&tr); err != nil {
 			return err
 		}
 		cacheKey := oauth.TokenURL + "|" + conf.Username + "|" + conf.Label
-		store, err := loadTokenStore()
+		store, err := loadTokenStore(log)
 		if err != nil {
 			return err
 		}
 		if tr.RefreshToken != "" {
 			store[cacheKey] = tr.RefreshToken // rimuovi eventuale legacy key
-			if _, ok := store[oauth.TokenURL+"||"+conf.Label]; ok {
-				delete(store, oauth.TokenURL+"||"+conf.Label)
-			}
-			if err := saveTokenStore(store); err != nil {
+			delete(store, oauth.TokenURL+"||"+conf.Label)
+			if err := saveTokenStore(log, store); err != nil {
 				return err
 			}
 		}
@@ -753,7 +782,7 @@ func runOAuth2Flow(conf ProviderConfiguration, autoOpen bool) error {
 }
 
 // Device Code Flow generico (MS v2: /devicecode)
-func runOAuth2DeviceFlow(conf ProviderConfiguration) error {
+func runOAuth2DeviceFlow(log *zap.SugaredLogger, conf ProviderConfiguration) error {
 	if conf.OAuth2 == nil {
 		return fmt.Errorf("no oauth2 configuration")
 	}
@@ -773,7 +802,11 @@ func runOAuth2DeviceFlow(conf ProviderConfiguration) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Errorf("Error closing response body: %s", err)
+		}
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("device code endpoint returned %d: %s", resp.StatusCode, string(b))
@@ -810,21 +843,19 @@ func runOAuth2DeviceFlow(conf ProviderConfiguration) error {
 				ExpiresIn                 int64
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				return err
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			cacheKey := oauth.TokenURL + "|" + conf.Username + "|" + conf.Label
-			store, err := loadTokenStore()
+			store, err := loadTokenStore(log)
 			if err != nil {
 				return err
 			}
 			if tr.RefreshToken != "" {
 				store[cacheKey] = tr.RefreshToken
-				if _, ok := store[oauth.TokenURL+"||"+conf.Label]; ok {
-					delete(store, oauth.TokenURL+"||"+conf.Label)
-				}
-				if err := saveTokenStore(store); err != nil {
+				delete(store, oauth.TokenURL+"||"+conf.Label)
+				if err := saveTokenStore(log, store); err != nil {
 					return err
 				}
 			}
@@ -834,7 +865,7 @@ func runOAuth2DeviceFlow(conf ProviderConfiguration) error {
 			return nil
 		}
 		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if strings.Contains(string(b), "authorization_pending") {
 			time.Sleep(time.Duration(dc.Interval) * time.Second)
 			continue
@@ -896,14 +927,14 @@ func main() {
 			if conf.OAuth2 != nil {
 				if doLoginDevice {
 					log.Infof("%s: avvio device code flow...", conf.Label)
-					if err := runOAuth2DeviceFlow(conf); err != nil {
+					if err := runOAuth2DeviceFlow(log, conf); err != nil {
 						log.Errorf("%s: device code login failed: %v", conf.Label, err)
 					} else {
 						log.Infof("%s: device code login completed", conf.Label)
 					}
 				} else {
 					log.Infof("%s: avvio authorization code flow...", conf.Label)
-					if err := runOAuth2Flow(conf, openAuthURL); err != nil {
+					if err := runOAuth2Flow(log, conf, openAuthURL); err != nil {
 						log.Errorf("%s: OAuth2 login failed: %v", conf.Label, err)
 					} else {
 						log.Infof("%s: OAuth2 login completed", conf.Label)
@@ -911,7 +942,7 @@ func main() {
 				}
 			} else {
 				log.Infof("%s: test login username/password...", conf.Label)
-				if err := tryPasswordLogin(conf); err != nil {
+				if err := tryPasswordLogin(conf, log); err != nil {
 					log.Errorf("%s: login failed: %v", conf.Label, err)
 				} else {
 					log.Infof("%s: password login successful", conf.Label)
