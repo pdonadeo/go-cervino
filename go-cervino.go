@@ -17,7 +17,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,12 +61,41 @@ type Configuration struct {
 	Providers []ProviderConfiguration `yaml:"providers"`
 }
 
-var appName = "go-cervino"
+type SeenStatus struct {
+	Lock sync.Mutex
+	Seen map[string]map[uint32]struct{} // key: conf.Label -> set di UID notificati
+}
+
+func NewSeenStatus() *SeenStatus {
+	return &SeenStatus{
+		Seen: make(map[string]map[uint32]struct{}),
+	}
+}
+
+func (s *SeenStatus) markSeen(label string, uids []uint32) {
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	if _, ok := s.Seen[label]; !ok {
+		s.Seen[label] = make(map[uint32]struct{})
+	}
+	for _, u := range uids {
+		s.Seen[label][u] = struct{}{}
+	}
+}
+
+func (s *SeenStatus) isSeen(label string, uid uint32) bool {
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	_, ok := s.Seen[label][uid]
+	return ok
+}
 
 // debug flags set from main
 var (
+	appName           string = "go-cervino"
 	globalIMAPTrace   bool
 	globalDebugTokens bool
+	seenStatus        = NewSeenStatus()
 )
 
 // tokenCacheItem mantiene un access token e la scadenza.
@@ -138,132 +166,6 @@ func saveTokenStore(log *zap.SugaredLogger, m map[string]string) error {
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(m)
-}
-
-func keys[K comparable, V any](m map[K]V) []K {
-	out := make([]K, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-
-func printMessage(log *zap.SugaredLogger, conf ProviderConfiguration, msg imap.Message) {
-	log.Debugf("%s: EMAIL %d", conf.Label, msg.SeqNum)
-	log.Debugf("%s: \tDATE = %s", conf.Label, msg.Envelope.Date)
-	log.Debugf("%s: \tSUBJECT = %s", conf.Label, msg.Envelope.Subject)
-	for i, f := range msg.Envelope.From {
-		log.Debugf("%s: \tFROM[%d] = \"%s\" <%s@%s>", conf.Label, i+1, f.PersonalName, f.MailboxName, f.HostName)
-	}
-	for i, f := range msg.Flags {
-		log.Debugf("%s: \tFLAG[%d] = %s", conf.Label, i+1, f)
-	}
-	log.Debugf("%s: \tMESSAGE-ID = %s", conf.Label, msg.Envelope.MessageId)
-}
-
-func printMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages map[uint32]imap.Message) {
-	k := keys(messages)
-	sort.Slice(k, func(i, j int) bool { return k[i] < k[j] })
-	for _, seq := range k {
-		printMessage(log, conf, messages[seq])
-	}
-}
-
-func printMailboxStatus(log *zap.SugaredLogger, msg string, conf ProviderConfiguration, mboxStatus *imap.MailboxStatus) {
-	log.Debugf("%s: %s", conf.Label, msg)
-	log.Debugf("%s: Mailbox update: %d messages, %d recent, %d unseen, %d unseenSeqNum", conf.Label, mboxStatus.Messages, mboxStatus.Recent, mboxStatus.Unseen, mboxStatus.UnseenSeqNum)
-}
-
-func updateMessagesMap(log *zap.SugaredLogger, conf ProviderConfiguration, mboxMap map[uint32]imap.Message, mboxStatus *imap.MailboxStatus, c *client.Client, alsoNewMessages bool) (map[uint32]imap.Message, error) {
-	printMailboxStatus(log, "UpdateMessageMap", conf, mboxStatus)
-	if mboxStatus.Messages == 0 {
-		log.Debugf("%s: UpdateMessageMap: mboxStatus.Messages == 0", conf.Label)
-		return mboxMap, nil
-	}
-	var from uint32
-	if alsoNewMessages {
-		from = 1
-	} else {
-		if mboxStatus.UnseenSeqNum == 0 {
-			from = 1
-		} else {
-			from = mboxStatus.UnseenSeqNum
-		}
-	}
-	to := mboxStatus.Messages
-	log.Debugf("%s: UpdateMessageMap: from=%d to=%d", conf.Label, from, to)
-	seqset := new(imap.SeqSet)
-	seqset.AddRange(from, to)
-	messages := make(chan *imap.Message, 10)
-	done := make(chan error, 1)
-	go func() { done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchAll}, messages) }()
-	for msg := range messages {
-		if msg == nil {
-			continue
-		}
-		if _, exists := mboxMap[msg.SeqNum]; !exists {
-			mboxMap[msg.SeqNum] = *msg
-			isRecent := false
-			for _, f := range msg.Flags {
-				if f == imap.RecentFlag {
-					isRecent = true
-					break
-				}
-			}
-			isNew := true
-			for _, f := range msg.Flags {
-				if f == imap.SeenFlag {
-					isNew = false
-					break
-				}
-			}
-			if (alsoNewMessages && isNew) || isRecent {
-				fromName := ""
-				if len(msg.Envelope.From) > 0 {
-					fromName = msg.Envelope.From[0].PersonalName
-				}
-				ntf := notify.NewNotification("New email in "+conf.Label, fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, fromName))
-				ntf.AppName = appName
-				if conf.Icon == "" {
-					ntf.AppIcon = "mail-unread"
-				} else {
-					ntf.AppIcon = conf.Icon
-				}
-				if conf.Timeout > 0 {
-					ntf.Timeout = conf.Timeout * 1000
-				} else {
-					ntf.Timeout = notify.ExpiresNever
-				}
-				ntf.Hints = make(map[string]interface{})
-				if conf.Sound != "" {
-					ntf.Hints[notify.HintSoundFile] = conf.Sound
-				}
-				_, _ = ntf.Show()
-			}
-		}
-	}
-	if err := <-done; err != nil {
-		return nil, err
-	}
-	printMessages(log, conf, mboxMap)
-	return mboxMap, nil
-}
-
-func expunge(log *zap.SugaredLogger, conf ProviderConfiguration, mboxMap map[uint32]imap.Message, seqNum uint32) map[uint32]imap.Message {
-	k := keys(mboxMap)
-	sort.Slice(k, func(i, j int) bool { return k[i] < k[j] })
-	newMboxMap := make(map[uint32]imap.Message)
-	newSeqNum := uint32(1)
-	for _, key := range k {
-		msg := mboxMap[key]
-		if msg.SeqNum != seqNum {
-			msg.SeqNum = newSeqNum
-			newMboxMap[newSeqNum] = msg
-			newSeqNum++
-		}
-	}
-	printMessages(log, conf, newMboxMap)
-	return newMboxMap
 }
 
 // ===== OAuth2 helpers =====
@@ -383,37 +285,27 @@ func (c *xoauth2Client) Start() (string, []byte, error) {
 }
 func (c *xoauth2Client) Next(challenge []byte) ([]byte, error) { return nil, nil }
 
-// IMAP trace redaction
-type redactingWriter struct{ dst io.Writer }
-
-func (w redactingWriter) Write(p []byte) (int, error) {
-	line := string(p)
-	if strings.Contains(line, "AUTHENTICATE XOAUTH2") || strings.Contains(line, "Bearer ") {
-		line = redactBearer(line)
-	}
-	return w.dst.Write([]byte(line))
+// Writer che aggiunge un prefisso di direzione e redige i bearer token.
+type sideWriter struct {
+	prefix string
+	dst    io.Writer
 }
 
-func redactBearer(s string) string {
-	if i := strings.Index(s, "Bearer "); i != -1 {
-		prefix := s[:i+7]
-		rest := s[i+7:]
-		if j := strings.Index(rest, "\r\n"); j != -1 {
-			rest = rest[:j]
-		}
-		if len(rest) > 8 {
-			rest = rest[:8]
-		}
-		return prefix + rest + "… [REDACTED]\r\n"
-	}
-	return s
+func (w sideWriter) Write(p []byte) (int, error) {
+	fmt.Fprintf(os.Stderr, "--- [%s] -------------------------------------------------------------------\n", w.prefix)
+	_ = os.Stderr.Sync()
+	n, err := w.dst.Write(p)
+	fmt.Fprintf(os.Stderr, "================================================================================\n")
+	_ = os.Stderr.Sync()
+	return n, err
 }
 
 func enableIMAPTrace(c *client.Client, log *zap.SugaredLogger) {
-	if setter, ok := interface{}(c).(interface{ SetDebug(w io.Writer) }); ok {
-		setter.SetDebug(redactingWriter{dst: os.Stderr})
-		log.Infof("IMAP trace attivato (token redatti)")
-	}
+	local := sideWriter{prefix: "CLIENT", dst: os.Stderr}
+	remote := sideWriter{prefix: "SERVER", dst: os.Stderr}
+	dw := imap.NewDebugWriter(local, remote)
+	c.SetDebug(dw)
+	log.Infof("IMAP trace attivato")
 }
 
 // Decodifica (senza verifica) del payload JWT per loggare aud/scp
@@ -443,6 +335,122 @@ func logTokenClaims(log *zap.SugaredLogger, accessToken string) {
 	log.Debugf("JWT aud=%q scp=%q appid=%q user=%q", aud, scp, app, upn)
 }
 
+func fetchUnseenUIDs(c *client.Client) ([]uint32, error) {
+	criteria := imap.NewSearchCriteria()
+	criteria.WithoutFlags = []string{imap.SeenFlag}
+	return c.UidSearch(criteria)
+}
+
+func fetchByUIDs(c *client.Client, uids []uint32) ([]*imap.Message, error) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	seqset := new(imap.SeqSet)
+	for _, u := range uids {
+		seqset.AddNum(u)
+	}
+	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchInternalDate, imap.FetchUid}
+	ch := make(chan *imap.Message, 10)
+	done := make(chan error, 1)
+	go func() { done <- c.UidFetch(seqset, items, ch) }()
+	var out []*imap.Message
+	for m := range ch {
+		if m != nil {
+			out = append(out, m)
+		}
+	}
+	if err := <-done; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*imap.Message) {
+	var newly []uint32
+	for _, msg := range msgs {
+		uid := msg.Uid
+		if seenStatus.isSeen(conf.Label, uid) {
+			continue
+		}
+		isNew := true
+		for _, f := range msg.Flags {
+			if f == imap.SeenFlag {
+				isNew = false
+				break
+			}
+		}
+		if !isNew {
+			continue
+		}
+
+		fromName := ""
+		if len(msg.Envelope.From) > 0 {
+			fromName = msg.Envelope.From[0].PersonalName
+		}
+		ntf := notify.NewNotification(
+			"New email in "+conf.Label,
+			fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, fromName),
+		)
+		ntf.AppName = appName
+		if conf.Icon == "" {
+			ntf.AppIcon = "mail-unread"
+		} else {
+			ntf.AppIcon = conf.Icon
+		}
+		if conf.Timeout > 0 {
+			ntf.Timeout = conf.Timeout * 1000
+		} else {
+			ntf.Timeout = notify.ExpiresNever
+		}
+		ntf.Hints = make(map[string]interface{})
+		if conf.Sound != "" {
+			ntf.Hints[notify.HintSoundFile] = conf.Sound
+		}
+		_, _ = ntf.Show()
+
+		newly = append(newly, uid)
+	}
+	if len(newly) > 0 {
+		seenStatus.markSeen(conf.Label, newly)
+	}
+	printMessages(log, conf, msgs)
+}
+
+func startIdle(c *client.Client) func() {
+	stopIdle := make(chan struct{})
+	doneIdle := make(chan error, 1)
+	go func() { doneIdle <- c.Idle(stopIdle, nil) }()
+	return func() {
+		close(stopIdle)
+		<-doneIdle
+	}
+}
+
+func printMailboxStatus(log *zap.SugaredLogger, msg string, conf ProviderConfiguration, mboxStatus *imap.MailboxStatus) {
+	log.Debugf("%s: %s", conf.Label, msg)
+	log.Debugf("%s: Mailbox update: %d messages, %d recent, %d unseen, %d unseenSeqNum",
+		conf.Label, mboxStatus.Messages, mboxStatus.Recent, mboxStatus.Unseen, mboxStatus.UnseenSeqNum)
+}
+
+func printMessage(log *zap.SugaredLogger, conf ProviderConfiguration, msg imap.Message) {
+	log.Debugf("%s: EMAIL %d", conf.Label, msg.SeqNum)
+	log.Debugf("%s: \tDATE = %s", conf.Label, msg.Envelope.Date)
+	log.Debugf("%s: \tSUBJECT = %s", conf.Label, msg.Envelope.Subject)
+	for i, f := range msg.Envelope.From {
+		log.Debugf("%s: \tFROM[%d] = \"%s\" <%s@%s>", conf.Label, i+1, f.PersonalName, f.MailboxName, f.HostName)
+	}
+	for i, f := range msg.Flags {
+		log.Debugf("%s: \tFLAG[%d] = %s", conf.Label, i+1, f)
+	}
+	log.Debugf("%s: \tMESSAGE-ID = %s", conf.Label, msg.Envelope.MessageId)
+}
+
+func printMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages []*imap.Message) {
+	for _, msg := range messages {
+		printMessage(log, conf, *msg)
+	}
+}
+
 func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration) {
 	keepAlive := 5 * time.Minute
 	for {
@@ -451,6 +459,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			return
 		default:
 		}
+
 		log.Debugf("Connecting to \"%s\"...", conf.Label)
 		addr := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
 		c, err := client.DialTLS(addr, nil)
@@ -459,9 +468,11 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			time.Sleep(5 * time.Second)
 			continue
 		}
+
 		if globalIMAPTrace {
 			enableIMAPTrace(c, log)
 		}
+
 		log.Debugf("...%s connected", conf.Label)
 		if conf.OAuth2 != nil {
 			if strings.TrimSpace(conf.Username) == "" {
@@ -483,11 +494,11 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			if globalDebugTokens {
 				logTokenClaims(log, token)
 			}
-			log.Debugf("%s: XOAUTH2 user=%q (token redatto)", conf.Label, conf.Username)
+			log.Debugf("%s: XOAUTH2 user=%q", conf.Label, conf.Username)
 			auth := NewXOAuth2(conf.Username, token)
 			if err = c.Authenticate(auth); err != nil {
 				log.Errorf("%s: OAuth2 auth failed: %v", conf.Label, err)
-				log.Infof("Suggerimento: avvia con --imap-trace per vedere il dialogo IMAP (token redatti).")
+				log.Infof("Suggerimento: avvia con --imap-trace per vedere il dialogo IMAP.")
 				_ = c.Logout()
 				time.Sleep(5 * time.Second)
 				cacheKey := conf.OAuth2.TokenURL + "|" + conf.Username + "|" + conf.Label
@@ -505,64 +516,59 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			}
 		}
 		log.Debugf("%s logged in", conf.Label)
+
 		if conf.Mailbox == "" {
 			conf.Mailbox = "INBOX"
 		}
+
+		uids, err := fetchUnseenUIDs(c)
+		if err == nil && len(uids) > 0 {
+			seenStatus.markSeen(conf.Label, uids)
+		}
+
+		updates := make(chan client.Update, 1024)
+		c.Updates = updates
 		inboxStatus, err := c.Select(conf.Mailbox, true)
 		if err != nil {
-			log.Errorf("%s: select error: %v", conf.Label, err)
-			_ = c.Logout()
-			time.Sleep(5 * time.Second)
+			log.Errorf("%s: select mailbox error: %v", conf.Label, err)
 			continue
 		}
-		mboxMap := make(map[uint32]imap.Message)
-		mboxMap, err = updateMessagesMap(log, conf, mboxMap, inboxStatus, c, true)
-		if err != nil {
-			log.Errorf("%s: update messages error: %v", conf.Label, err)
-			_ = c.Logout()
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		updates := make(chan client.Update, 128)
-		c.Updates = updates
-		stopIdle := make(chan struct{})
-		doneIdle := make(chan error, 1)
-		go func() { doneIdle <- c.Idle(stopIdle, nil) }()
+		printMailboxStatus(log, "Mailbox selected", conf, inboxStatus)
+		stopIdle := startIdle(c)
+
 	loop:
 		for {
 			select {
 			case <-ctx.Done():
-				close(stopIdle)
-				<-doneIdle
+				stopIdle()
 				_ = c.Logout()
 				return
 			case update := <-updates:
-				close(stopIdle)
-				<-doneIdle
-				switch u := update.(type) {
+				stopIdle()
+				switch update.(type) {
 				case *client.MailboxUpdate:
-					inboxStatus, err = c.Select(conf.Mailbox, true)
+					uids, err := fetchUnseenUIDs(c)
 					if err != nil {
-						log.Errorf("%s: select after update error: %v", conf.Label, err)
+						log.Errorf("%s: search unseen error: %v", conf.Label, err)
 						break loop
 					}
-					mboxMap, err = updateMessagesMap(log, conf, mboxMap, inboxStatus, c, false)
+					var toFetch []uint32
+					for _, u := range uids {
+						if !seenStatus.isSeen(conf.Label, u) {
+							toFetch = append(toFetch, u)
+						}
+					}
+					msgs, err := fetchByUIDs(c, toFetch)
 					if err != nil {
-						log.Errorf("%s: updateMessagesMap error: %v", conf.Label, err)
+						log.Errorf("%s: fetch by uid error: %v", conf.Label, err)
 						break loop
 					}
-				case *client.ExpungeUpdate:
-					mboxMap = expunge(log, conf, mboxMap, u.SeqNum)
+					notifyNewUIDs(log, conf, msgs)
 				}
-				stopIdle = make(chan struct{})
-				doneIdle = make(chan error, 1)
-				go func() { doneIdle <- c.Idle(stopIdle, nil) }()
+				stopIdle = startIdle(c)
 			case <-time.After(keepAlive):
-				close(stopIdle)
-				<-doneIdle
-				stopIdle = make(chan struct{})
-				doneIdle = make(chan error, 1)
-				go func() { doneIdle <- c.Idle(stopIdle, nil) }()
+				stopIdle()
+				stopIdle = startIdle(c)
 			}
 		}
 		_ = c.Logout()
@@ -887,9 +893,7 @@ func main() {
 	config.Level = level
 	logger, _ := config.Build()
 	defer func() {
-		if err := logger.Sync(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error syncing logger: %s\n", err)
-		}
+		_ = logger.Sync()
 	}()
 	log := logger.Sugar()
 	var configuration Configuration
@@ -899,7 +903,6 @@ func main() {
 	var doLoginDevice bool
 	var openAuthURL bool
 	var imapTrace bool
-	var debugTokens bool
 	flag.StringVar(&confFile, "c", "config.yaml", "Configuration file")
 	flag.StringVar(&confFile, "configuration", "config.yaml", "Configuration file")
 	flag.BoolVar(&debug, "d", false, "Debug mode")
@@ -907,13 +910,11 @@ func main() {
 	flag.BoolVar(&doLoginDevice, "login-device", false, "Esegui login interattivo (device code flow) per tutti i provider e esci")
 	flag.BoolVar(&openAuthURL, "open-browser", false, "Prova ad aprire automaticamente il browser durante il login")
 	flag.BoolVar(&imapTrace, "imap-trace", false, "Stampa il dialogo IMAP (token redatti)")
-	flag.BoolVar(&debugTokens, "debug-tokens", false, "Logga aud/scp dei JWT ottenuti")
 	flag.Parse()
 	if debug {
 		level.SetLevel(zap.DebugLevel)
 	}
 	globalIMAPTrace = imapTrace
-	globalDebugTokens = debugTokens
 	log.Infof("Starting %s", appName)
 	data, err := os.ReadFile(confFile)
 	if err != nil {
