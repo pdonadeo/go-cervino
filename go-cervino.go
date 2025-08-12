@@ -188,7 +188,7 @@ func codeChallengeS256(verifier string) string {
 // getAccessTokenFromRefreshToken: obtains access token from refresh token.
 func getAccessTokenFromRefreshToken(ctx context.Context, log *zap.SugaredLogger, oauth *OAuth2Config) (string, time.Time, error) {
 	if oauth.TokenURL == "" {
-		return "", time.Time{}, fmt.Errorf("token_url non impostato in configurazione OAuth2")
+    return "", time.Time{}, fmt.Errorf("token_url not set in OAuth2 configuration")
 	}
 	form := url.Values{}
 	form.Set("client_id", oauth.ClientID)
@@ -475,7 +475,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		log.Debugf("...%s connected", conf.Label)
 		if conf.OAuth2 != nil {
 			if strings.TrimSpace(conf.Username) == "" {
-				log.Errorf("%s: username mancante: XOAUTH2 richiede l'indirizzo email completo (es. user@domain)", conf.Label)
+				log.Errorf("%s: missing username: XOAUTH2 requires the full email address (e.g. user@domain)", conf.Label)
 				_ = c.Logout()
 				time.Sleep(5 * time.Second)
 				continue
@@ -497,7 +497,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			auth := NewXOAuth2(conf.Username, token)
 			if err = c.Authenticate(auth); err != nil {
 				log.Errorf("%s: OAuth2 auth failed: %v", conf.Label, err)
-				log.Infof("Suggerimento: avvia con --imap-trace per vedere il dialogo IMAP.")
+				log.Infof("Tip: start with --imap-trace to see the IMAP dialog.")
 				_ = c.Logout()
 				time.Sleep(5 * time.Second)
 				cacheKey := conf.OAuth2.TokenURL + "|" + conf.Username + "|" + conf.Label
@@ -700,7 +700,7 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 			}
 			return
 		}
-		_, _ = io.WriteString(w, "Autenticazione completata. Puoi chiudere questa finestra e tornare al terminale.\n")
+    _, _ = io.WriteString(w, "Authentication completed. You can close this window and return to the terminal.\n")
 		select {
 		case codeCh <- code:
 		default:
@@ -715,8 +715,8 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 			}
 		}
 	}()
-	fmt.Printf("Apri nel browser la seguente URL e concedi l'accesso:\n%s\n", authURL)
-	fmt.Printf("Se possibile, verrai reindirizzato a %s\n", redirectURI)
+	fmt.Printf("Open the following URL in your browser and grant access:\n%s\n", authURL)
+	fmt.Printf("If possible, you will be redirected to %s\n", redirectURI)
 	if autoOpen {
 		_ = openBrowser(authURL)
 	}
@@ -806,8 +806,8 @@ func main() {
 	flag.StringVar(&confFile, "c", "config.yaml", "Configuration file")
 	flag.StringVar(&confFile, "configuration", "config.yaml", "Configuration file")
 	flag.BoolVar(&debug, "d", false, "Debug mode")
-	flag.BoolVar(&doLogin, "login", false, "Esegui login interattivo (authorization code) per tutti i provider e esci")
-	flag.BoolVar(&openAuthURL, "open-browser", false, "Prova ad aprire automaticamente il browser durante il login")
+	flag.BoolVar(&doLogin, "login", false, "Perform interactive login (authorization code) for all providers and exit")
+	flag.BoolVar(&openAuthURL, "open-browser", false, "Try to automatically open the browser during login")
 	flag.BoolVar(&imapTrace, "imap-trace", false, "Stampa il dialogo IMAP (token redatti)")
 	flag.Parse()
 
@@ -829,14 +829,14 @@ func main() {
 	if doLogin {
 		for _, conf := range configuration.Providers {
 			if conf.OAuth2 != nil {
-				log.Infof("%s: avvio authorization code flow...", conf.Label)
+				log.Infof("%s: starting authorization code flow...", conf.Label)
 				if err := runOAuth2Flow(log, conf, openAuthURL); err != nil {
 					log.Errorf("%s: OAuth2 login failed: %v", conf.Label, err)
 				} else {
 					log.Infof("%s: OAuth2 login completed", conf.Label)
 				}
 			} else {
-				log.Infof("%s: test login username/password...", conf.Label)
+				log.Infof("%s: testing login username/password...", conf.Label)
 				if err := tryPasswordLogin(conf, log); err != nil {
 					log.Errorf("%s: login failed: %v", conf.Label, err)
 				} else {
