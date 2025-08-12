@@ -31,15 +31,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// OAuth2Config contiene i campi necessari per ottenere access/refresh token.
-// Supporta authorization code flow (con redirect locale).
+// OAuth2Config contains the fields required to obtain access/refresh tokens.
+// Supports authorization code flow (with local redirect).
 type OAuth2Config struct {
 	ClientID     string   `yaml:"client_id"`
 	ClientSecret string   `yaml:"client_secret"`
 	RefreshToken string   `yaml:"refresh_token"`
 	TokenURL     string   `yaml:"token_url"`
 	AuthURL      string   `yaml:"auth_url"`
-	RedirectURI  string   `yaml:"redirect_uri"` // opzionale; se presente, il listener usa host:porta indicati
+	RedirectURI  string   `yaml:"redirect_uri"` // optional; if present, the listener uses the specified host:port
 	Scope        []string `yaml:"scope"`
 }
 
@@ -62,7 +62,7 @@ type Configuration struct {
 
 type SeenStatus struct {
 	Lock sync.Mutex
-	Seen map[string]map[uint32]struct{} // key: conf.Label -> set di UID notificati
+	Seen map[string]map[uint32]struct{} // key: conf.Label -> set of notified UIDs
 }
 
 func NewSeenStatus() *SeenStatus {
@@ -97,20 +97,20 @@ var (
 	seenStatus        = NewSeenStatus()
 )
 
-// tokenCacheItem mantiene un access token e la scadenza.
+// tokenCacheItem stores an access token and its expiration.
 type tokenCacheItem struct {
 	AccessToken string
 	Expiry      time.Time
 }
 
-// cache in memoria per token
+// tokenCache is a simple in-memory cache for access tokens.
 var tokenCache = struct {
 	sync.Mutex
 	m map[string]tokenCacheItem
 }{m: make(map[string]tokenCacheItem)}
 
-// token store su disco: salviamo solo refresh_token per provider/user/token_url
-// percorso: $XDG_CONFIG_HOME/go-cervino/oauth_tokens.json oppure ~/.config/go-cervino/oauth_tokens.json
+// token store on disk: we only save refresh_token for provider/user/token_url
+// path: $XDG_CONFIG_HOME/go-cervino/oauth_tokens.json or ~/.config/go-cervino/oauth_tokens.json
 func tokenStorePath() string {
 	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
 		return filepath.Join(x, "go-cervino", "oauth_tokens.json")
@@ -185,7 +185,7 @@ func codeChallengeS256(verifier string) string {
 	return b64url(sum[:])
 }
 
-// getAccessTokenFromRefreshToken: ottiene access token da refresh token.
+// getAccessTokenFromRefreshToken: obtains access token from refresh token.
 func getAccessTokenFromRefreshToken(ctx context.Context, log *zap.SugaredLogger, oauth *OAuth2Config) (string, time.Time, error) {
 	if oauth.TokenURL == "" {
 		return "", time.Time{}, fmt.Errorf("token_url non impostato in configurazione OAuth2")
@@ -234,7 +234,7 @@ func getAccessTokenFromRefreshToken(ctx context.Context, log *zap.SugaredLogger,
 	return tokenResp.AccessToken, expiry, nil
 }
 
-// fetchAccessToken: cache + refresh + migrazione chiave legacy
+// fetchAccessToken: cache + refresh + migration of legacy key
 func fetchAccessToken(ctx context.Context, log *zap.SugaredLogger, label, username string, oauth *OAuth2Config) (string, error) {
 	primaryKey := oauth.TokenURL + "|" + username + "|" + label
 	legacyKey := oauth.TokenURL + "||" + label
@@ -284,7 +284,6 @@ func (c *xoauth2Client) Start() (string, []byte, error) {
 }
 func (c *xoauth2Client) Next(challenge []byte) ([]byte, error) { return nil, nil }
 
-// Writer che aggiunge un prefisso di direzione e redige i bearer token.
 type sideWriter struct {
 	prefix string
 	dst    io.Writer
@@ -307,7 +306,7 @@ func enableIMAPTrace(c *client.Client, log *zap.SugaredLogger) {
 	log.Infof("IMAP trace attivato")
 }
 
-// Decodifica (senza verifica) del payload JWT per loggare aud/scp
+// Decoding (without verification) of the JWT payload to log aud/scp
 func logTokenClaims(log *zap.SugaredLogger, accessToken string) {
 	parts := strings.Split(accessToken, ".")
 	if len(parts) < 2 {
@@ -576,7 +575,6 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 	}
 }
 
-// tryPasswordLogin: test di login utente/password.
 func tryPasswordLogin(conf ProviderConfiguration, log *zap.SugaredLogger) error {
 	addr := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
 	c, err := client.DialTLS(addr, nil)
@@ -591,7 +589,7 @@ func tryPasswordLogin(conf ProviderConfiguration, log *zap.SugaredLogger) error 
 	return c.Login(conf.Username, conf.Password)
 }
 
-// openBrowser apre l'URL nel browser di sistema (best effort)
+// openBrowser opens the URL in the system browser (best effort)
 func openBrowser(url string) error {
 	switch runtime.GOOS {
 	case "linux":
@@ -605,7 +603,7 @@ func openBrowser(url string) error {
 	}
 }
 
-// Authorization Code Flow con listener locale + PKCE quando client_secret è vuoto
+// Authorization Code Flow with local listener + PKCE when client_secret is empty
 func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen bool) error {
 	if conf.OAuth2 == nil {
 		return fmt.Errorf("no oauth2 configuration")
@@ -768,7 +766,7 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 			return err
 		}
 		if tr.RefreshToken != "" {
-			store[cacheKey] = tr.RefreshToken // rimuovi eventuale legacy key
+			store[cacheKey] = tr.RefreshToken
 			delete(store, oauth.TokenURL+"||"+conf.Label)
 			if err := saveTokenStore(log, store); err != nil {
 				return err
