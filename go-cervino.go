@@ -32,16 +32,15 @@ import (
 )
 
 // OAuth2Config contiene i campi necessari per ottenere access/refresh token.
-// Supporta sia authorization code flow (con redirect locale) sia device code flow.
+// Supporta authorization code flow (con redirect locale).
 type OAuth2Config struct {
-	ClientID      string   `yaml:"client_id"`
-	ClientSecret  string   `yaml:"client_secret"`
-	RefreshToken  string   `yaml:"refresh_token"`
-	TokenURL      string   `yaml:"token_url"`
-	AuthURL       string   `yaml:"auth_url"`
-	RedirectURI   string   `yaml:"redirect_uri"`    // opzionale; se presente, il listener usa host:porta indicati
-	DeviceCodeURL string   `yaml:"device_code_url"` // opzionale: device authorization flow
-	Scope         []string `yaml:"scope"`
+	ClientID     string   `yaml:"client_id"`
+	ClientSecret string   `yaml:"client_secret"`
+	RefreshToken string   `yaml:"refresh_token"`
+	TokenURL     string   `yaml:"token_url"`
+	AuthURL      string   `yaml:"auth_url"`
+	RedirectURI  string   `yaml:"redirect_uri"` // opzionale; se presente, il listener usa host:porta indicati
+	Scope        []string `yaml:"scope"`
 }
 
 type ProviderConfiguration struct {
@@ -349,8 +348,9 @@ func fetchByUIDs(c *client.Client, uids []uint32) ([]*imap.Message, error) {
 	for _, u := range uids {
 		seqset.AddNum(u)
 	}
+
 	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchInternalDate, imap.FetchUid}
-	ch := make(chan *imap.Message, 10)
+	ch := make(chan *imap.Message, 1024)
 	done := make(chan error, 1)
 	go func() { done <- c.UidFetch(seqset, items, ch) }()
 	var out []*imap.Message
@@ -787,105 +787,6 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 	}
 }
 
-// Device Code Flow generico (MS v2: /devicecode)
-func runOAuth2DeviceFlow(log *zap.SugaredLogger, conf ProviderConfiguration) error {
-	if conf.OAuth2 == nil {
-		return fmt.Errorf("no oauth2 configuration")
-	}
-	oauth := conf.OAuth2
-	if oauth.ClientID == "" || oauth.TokenURL == "" || oauth.DeviceCodeURL == "" {
-		return fmt.Errorf("device flow requires client_id, token_url, device_code_url")
-	}
-	form := url.Values{}
-	form.Set("client_id", oauth.ClientID)
-	if len(oauth.Scope) > 0 {
-		form.Set("scope", strings.Join(oauth.Scope, " "))
-	}
-	req, _ := http.NewRequest("POST", oauth.DeviceCodeURL, strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	hc := &http.Client{Timeout: 15 * time.Second}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			log.Errorf("Error closing response body: %s", err)
-		}
-	}()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("device code endpoint returned %d: %s", resp.StatusCode, string(b))
-	}
-	var dc struct {
-		DeviceCode, UserCode, VerificationURI, VerificationURIComplete string
-		ExpiresIn, Interval                                            int
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&dc); err != nil {
-		return err
-	}
-	if dc.Interval <= 0 {
-		dc.Interval = 5
-	}
-	fmt.Printf("Visita questa pagina e inserisci il codice:\n%s\nCodice: %s\n", dc.VerificationURI, dc.UserCode)
-	if dc.VerificationURIComplete != "" {
-		fmt.Printf("Oppure apri direttamente:\n%s\n", dc.VerificationURIComplete)
-	}
-	deadline := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
-	for time.Now().Before(deadline) {
-		form := url.Values{}
-		form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
-		form.Set("device_code", dc.DeviceCode)
-		form.Set("client_id", oauth.ClientID)
-		req, _ := http.NewRequest("POST", oauth.TokenURL, strings.NewReader(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		resp, err := hc.Do(req)
-		if err != nil {
-			return err
-		}
-		if resp.StatusCode == 200 {
-			var tr struct {
-				AccessToken, RefreshToken string
-				ExpiresIn                 int64
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-				_ = resp.Body.Close()
-				return err
-			}
-			_ = resp.Body.Close()
-			cacheKey := oauth.TokenURL + "|" + conf.Username + "|" + conf.Label
-			store, err := loadTokenStore(log)
-			if err != nil {
-				return err
-			}
-			if tr.RefreshToken != "" {
-				store[cacheKey] = tr.RefreshToken
-				delete(store, oauth.TokenURL+"||"+conf.Label)
-				if err := saveTokenStore(log, store); err != nil {
-					return err
-				}
-			}
-			if tr.RefreshToken != "" {
-				oauth.RefreshToken = tr.RefreshToken
-			}
-			return nil
-		}
-		b, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if strings.Contains(string(b), "authorization_pending") {
-			time.Sleep(time.Duration(dc.Interval) * time.Second)
-			continue
-		}
-		if strings.Contains(string(b), "slow_down") {
-			dc.Interval += 5
-			time.Sleep(time.Duration(dc.Interval) * time.Second)
-			continue
-		}
-		return fmt.Errorf("device flow failed: %s", string(b))
-	}
-	return fmt.Errorf("device code expired before authorization")
-}
-
 func main() {
 	config := zap.NewDevelopmentConfig()
 	level := zap.NewAtomicLevel()
@@ -896,26 +797,29 @@ func main() {
 		_ = logger.Sync()
 	}()
 	log := logger.Sugar()
+
 	var configuration Configuration
 	var confFile string
 	var debug bool
 	var doLogin bool
-	var doLoginDevice bool
 	var openAuthURL bool
 	var imapTrace bool
+
 	flag.StringVar(&confFile, "c", "config.yaml", "Configuration file")
 	flag.StringVar(&confFile, "configuration", "config.yaml", "Configuration file")
 	flag.BoolVar(&debug, "d", false, "Debug mode")
 	flag.BoolVar(&doLogin, "login", false, "Esegui login interattivo (authorization code) per tutti i provider e esci")
-	flag.BoolVar(&doLoginDevice, "login-device", false, "Esegui login interattivo (device code flow) per tutti i provider e esci")
 	flag.BoolVar(&openAuthURL, "open-browser", false, "Prova ad aprire automaticamente il browser durante il login")
 	flag.BoolVar(&imapTrace, "imap-trace", false, "Stampa il dialogo IMAP (token redatti)")
 	flag.Parse()
+
 	if debug {
 		level.SetLevel(zap.DebugLevel)
 	}
+
 	globalIMAPTrace = imapTrace
 	log.Infof("Starting %s", appName)
+
 	data, err := os.ReadFile(confFile)
 	if err != nil {
 		log.Fatalf("Error reading configuration file: %s", err)
@@ -923,23 +827,15 @@ func main() {
 	if err = yaml.Unmarshal(data, &configuration); err != nil {
 		log.Fatalf("Error parsing configuration file: %s", err)
 	}
-	if doLogin || doLoginDevice {
+
+	if doLogin {
 		for _, conf := range configuration.Providers {
 			if conf.OAuth2 != nil {
-				if doLoginDevice {
-					log.Infof("%s: avvio device code flow...", conf.Label)
-					if err := runOAuth2DeviceFlow(log, conf); err != nil {
-						log.Errorf("%s: device code login failed: %v", conf.Label, err)
-					} else {
-						log.Infof("%s: device code login completed", conf.Label)
-					}
+				log.Infof("%s: avvio authorization code flow...", conf.Label)
+				if err := runOAuth2Flow(log, conf, openAuthURL); err != nil {
+					log.Errorf("%s: OAuth2 login failed: %v", conf.Label, err)
 				} else {
-					log.Infof("%s: avvio authorization code flow...", conf.Label)
-					if err := runOAuth2Flow(log, conf, openAuthURL); err != nil {
-						log.Errorf("%s: OAuth2 login failed: %v", conf.Label, err)
-					} else {
-						log.Infof("%s: OAuth2 login completed", conf.Label)
-					}
+					log.Infof("%s: OAuth2 login completed", conf.Label)
 				}
 			} else {
 				log.Infof("%s: test login username/password...", conf.Label)
@@ -952,12 +848,18 @@ func main() {
 		}
 		return
 	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
+
 	var wg sync.WaitGroup
 	for _, conf := range configuration.Providers {
 		wg.Add(1)
-		go func(c ProviderConfiguration) { defer wg.Done(); runIMAPClient(ctx, log, c) }(conf)
+		go func(c ProviderConfiguration) {
+			defer wg.Done()
+			runIMAPClient(ctx, log, c)
+		}(conf)
 	}
+
 	wg.Wait()
 }
