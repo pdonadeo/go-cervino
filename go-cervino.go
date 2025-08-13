@@ -188,7 +188,7 @@ func codeChallengeS256(verifier string) string {
 // getAccessTokenFromRefreshToken: obtains access token from refresh token.
 func getAccessTokenFromRefreshToken(ctx context.Context, log *zap.SugaredLogger, oauth *OAuth2Config) (string, time.Time, error) {
 	if oauth.TokenURL == "" {
-    return "", time.Time{}, fmt.Errorf("token_url not set in OAuth2 configuration")
+		return "", time.Time{}, fmt.Errorf("token_url not set in OAuth2 configuration")
 	}
 	form := url.Values{}
 	form.Set("client_id", oauth.ClientID)
@@ -594,10 +594,6 @@ func openBrowser(url string) error {
 	switch runtime.GOOS {
 	case "linux":
 		return exec.Command("xdg-open", url).Start()
-	case "darwin":
-		return exec.Command("open", url).Start()
-	case "windows":
-		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 	default:
 		return fmt.Errorf("unsupported platform for auto-open")
 	}
@@ -700,7 +696,7 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 			}
 			return
 		}
-    _, _ = io.WriteString(w, "Authentication completed. You can close this window and return to the terminal.\n")
+		_, _ = io.WriteString(w, "Authentication completed. You can close this window and return to the terminal.\n")
 		select {
 		case codeCh <- code:
 		default:
