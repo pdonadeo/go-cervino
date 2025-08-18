@@ -303,24 +303,24 @@ func enableIMAPTrace(c *client.Client, log *zap.SugaredLogger) {
 	remote := sideWriter{prefix: "SERVER", dst: os.Stderr}
 	dw := imap.NewDebugWriter(local, remote)
 	c.SetDebug(dw)
-	log.Infof("IMAP trace attivato")
+	log.Infof("IMAP trace enabled")
 }
 
 // Decoding (without verification) of the JWT payload to log aud/scp
 func logTokenClaims(log *zap.SugaredLogger, accessToken string) {
 	parts := strings.Split(accessToken, ".")
 	if len(parts) < 2 {
-		log.Debug("token non sembra un JWT")
+		log.Debug("token does not appear to be a JWT")
 		return
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		log.Debugf("impossibile decodificare payload JWT: %v", err)
+		log.Debugf("unable to decode JWT payload: %v", err)
 		return
 	}
 	var m map[string]any
 	if err := json.Unmarshal(payload, &m); err != nil {
-		log.Debugf("payload JWT non JSON: %v", err)
+		log.Debugf("JWT payload is not JSON: %v", err)
 		return
 	}
 	aud, _ := m["aud"].(string)
@@ -840,7 +840,7 @@ func main() {
 	flag.BoolVar(&debug, "d", false, "Debug mode")
 	flag.BoolVar(&doLogin, "login", false, "Perform interactive login (authorization code) for all providers and exit")
 	flag.BoolVar(&openAuthURL, "open-browser", false, "Try to automatically open the browser during login")
-	flag.BoolVar(&imapTrace, "imap-trace", false, "Stampa il dialogo IMAP (token redatti)")
+	flag.BoolVar(&imapTrace, "imap-trace", false, "Print IMAP dialog")
 	flag.Parse()
 
 	if debug {
