@@ -415,13 +415,34 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 	printMessages(log, conf, msgs)
 }
 
-func startIdle(c *client.Client) func() {
+func withTimeout(ctx context.Context, timeout time.Duration, fn func() error) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- fn()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("operation timed out after %s", timeout)
+	}
+}
+
+func startIdle(ctx context.Context, c *client.Client) func() error {
 	stopIdle := make(chan struct{})
 	doneIdle := make(chan error, 1)
+
 	go func() { doneIdle <- c.Idle(stopIdle, nil) }()
-	return func() {
-		close(stopIdle)
-		<-doneIdle
+
+	return func() error {
+		return withTimeout(ctx, 5*time.Second, func() error {
+			close(stopIdle)
+			return <-doneIdle
+		})
 	}
 }
 
@@ -533,17 +554,27 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			continue
 		}
 		printMailboxStatus(log, "Mailbox selected", conf, inboxStatus)
-		stopIdle := startIdle(c)
+		stopIdle := startIdle(ctx, c)
 
 	loop:
 		for {
 			select {
 			case <-ctx.Done():
-				stopIdle()
-				_ = c.Logout()
+				err := stopIdle()
+				if err != nil {
+					log.Errorf("%s: error stopping idle: %v", conf.Label, err)
+					_ = c.Terminate()
+				} else {
+					_ = c.Logout()
+				}
 				return
 			case update := <-updates:
-				stopIdle()
+				err := stopIdle()
+				if err != nil {
+					log.Errorf("%s: error stopping idle: %v", conf.Label, err)
+					_ = c.Terminate()
+					break loop
+				}
 				switch update.(type) {
 				case *client.MailboxUpdate:
 					uids, err := fetchUnseenUIDs(c)
@@ -564,10 +595,15 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 					}
 					notifyNewUIDs(log, conf, msgs)
 				}
-				stopIdle = startIdle(c)
+				stopIdle = startIdle(ctx, c)
 			case <-time.After(keepAlive):
-				stopIdle()
-				stopIdle = startIdle(c)
+				err := stopIdle()
+				if err != nil {
+					log.Errorf("%s: error stopping idle: %v", conf.Label, err)
+					_ = c.Terminate()
+					break loop
+				}
+				stopIdle = startIdle(ctx, c)
 			}
 		}
 		_ = c.Logout()
