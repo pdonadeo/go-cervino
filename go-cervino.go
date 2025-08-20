@@ -64,6 +64,7 @@ type Configuration struct {
 const (
 	MaxSeenUIDs = 10000 // Maximum UIDs to keep per provider
 	SeenCleanupInterval = 1 * time.Hour
+	MaxFetchMessages = 1000 // Maximum messages to fetch at once
 )
 
 type SeenStatus struct {
@@ -387,13 +388,19 @@ func fetchByUIDs(c *client.Client, uids []uint32) ([]*imap.Message, error) {
 	if len(uids) == 0 {
 		return nil, nil
 	}
+	
+	// Limit the number of messages fetched at once to prevent memory issues
+	if len(uids) > MaxFetchMessages {
+		uids = uids[:MaxFetchMessages]
+	}
+	
 	seqset := new(imap.SeqSet)
 	for _, u := range uids {
 		seqset.AddNum(u)
 	}
 
 	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchInternalDate, imap.FetchUid}
-	ch := make(chan *imap.Message, 1024)
+	ch := make(chan *imap.Message, len(uids)) // Buffer size based on actual UIDs
 	done := make(chan error, 1)
 	go func() { done <- c.UidFetch(seqset, items, ch) }()
 	var out []*imap.Message
@@ -427,12 +434,21 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 		}
 
 		fromName := ""
-		if len(msg.Envelope.From) > 0 {
+		if len(msg.Envelope.From) > 0 && msg.Envelope.From[0] != nil {
 			fromName = msg.Envelope.From[0].PersonalName
 		}
+		
+		// Sanitize notification content to prevent potential HTML injection
+		subject := msg.Envelope.Subject
+		if subject == "" {
+			subject = "(no subject)"
+		}
+		safeSubject := strings.ReplaceAll(strings.ReplaceAll(subject, "<", "&lt;"), ">", "&gt;")
+		safeFromName := strings.ReplaceAll(strings.ReplaceAll(fromName, "<", "&lt;"), ">", "&gt;")
+		
 		ntf := notify.NewNotification(
 			"New email in "+conf.Label,
-			fmt.Sprintf("<b>%s</b> from <i>%s</i>", msg.Envelope.Subject, fromName),
+			fmt.Sprintf("<b>%s</b> from <i>%s</i>", safeSubject, safeFromName),
 		)
 		ntf.AppName = appName
 		if conf.Icon == "" {
