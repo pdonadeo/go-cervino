@@ -62,9 +62,9 @@ type Configuration struct {
 
 // Constants for cache management
 const (
-	MaxSeenUIDs = 10000 // Maximum UIDs to keep per provider
+	MaxSeenUIDs         = 10000 // Maximum UIDs to keep per provider
 	SeenCleanupInterval = 1 * time.Hour
-	MaxFetchMessages = 1000 // Maximum messages to fetch at once
+	MaxFetchMessages    = 1000 // Maximum messages to fetch at once
 )
 
 type SeenStatus struct {
@@ -87,7 +87,7 @@ func (s *SeenStatus) markSeen(label string, uids []uint32) {
 	for _, u := range uids {
 		s.Seen[label][u] = struct{}{}
 	}
-	
+
 	// Simple cleanup: if we exceed max UIDs, remove half of them (oldest UIDs)
 	if len(s.Seen[label]) > MaxSeenUIDs {
 		var toRemove []uint32
@@ -115,8 +115,8 @@ func (s *SeenStatus) isSeen(label string, uid uint32) bool {
 
 // Constants for timeouts and intervals
 const (
-	DefaultHTTPTimeout    = 15 * time.Second
-	DefaultOAuth2Timeout  = 30 * time.Second
+	DefaultHTTPTimeout   = 15 * time.Second
+	DefaultOAuth2Timeout = 30 * time.Second
 	IMAPKeepAlive        = 5 * time.Minute
 	ReconnectDelay       = 5 * time.Second
 	OAuth2FlowTimeout    = 5 * time.Minute
@@ -157,7 +157,7 @@ func tokenStorePath() string {
 
 func loadTokenStore(log *zap.SugaredLogger) (map[string]string, error) {
 	p := tokenStorePath()
-	
+
 	// Check file permissions for security
 	if info, err := os.Stat(p); err == nil {
 		mode := info.Mode()
@@ -165,7 +165,7 @@ func loadTokenStore(log *zap.SugaredLogger) (map[string]string, error) {
 			log.Warnf("Token store file %s has unsafe permissions %o, should be 0600", p, mode)
 		}
 	}
-	
+
 	f, err := os.Open(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -388,12 +388,12 @@ func fetchByUIDs(c *client.Client, uids []uint32) ([]*imap.Message, error) {
 	if len(uids) == 0 {
 		return nil, nil
 	}
-	
+
 	// Limit the number of messages fetched at once to prevent memory issues
 	if len(uids) > MaxFetchMessages {
 		uids = uids[:MaxFetchMessages]
 	}
-	
+
 	seqset := new(imap.SeqSet)
 	for _, u := range uids {
 		seqset.AddNum(u)
@@ -437,7 +437,7 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 		if len(msg.Envelope.From) > 0 && msg.Envelope.From[0] != nil {
 			fromName = msg.Envelope.From[0].PersonalName
 		}
-		
+
 		// Sanitize notification content to prevent potential HTML injection
 		subject := msg.Envelope.Subject
 		if subject == "" {
@@ -445,7 +445,7 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 		}
 		safeSubject := strings.ReplaceAll(strings.ReplaceAll(subject, "<", "&lt;"), ">", "&gt;")
 		safeFromName := strings.ReplaceAll(strings.ReplaceAll(fromName, "<", "&lt;"), ">", "&gt;")
-		
+
 		ntf := notify.NewNotification(
 			"New email in "+conf.Label,
 			fmt.Sprintf("<b>%s</b> from <i>%s</i>", safeSubject, safeFromName),
@@ -941,8 +941,8 @@ func main() {
 		}
 		if conf.OAuth2 != nil {
 			if conf.OAuth2.RedirectURI != "" {
-				if u, err := url.Parse(conf.OAuth2.RedirectURI); err != nil || 
-				   (u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1") {
+				if u, err := url.Parse(conf.OAuth2.RedirectURI); err != nil ||
+					(u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1") {
 					log.Fatalf("Provider %s: redirect_uri must be localhost or 127.0.0.1", conf.Label)
 				}
 			}
