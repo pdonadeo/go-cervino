@@ -60,6 +60,12 @@ type Configuration struct {
 	Providers []ProviderConfiguration `yaml:"providers"`
 }
 
+// Constants for cache management
+const (
+	MaxSeenUIDs = 10000 // Maximum UIDs to keep per provider
+	SeenCleanupInterval = 1 * time.Hour
+)
+
 type SeenStatus struct {
 	Lock sync.Mutex
 	Seen map[string]map[uint32]struct{} // key: conf.Label -> set of notified UIDs
@@ -80,6 +86,23 @@ func (s *SeenStatus) markSeen(label string, uids []uint32) {
 	for _, u := range uids {
 		s.Seen[label][u] = struct{}{}
 	}
+	
+	// Simple cleanup: if we exceed max UIDs, remove half of them (oldest UIDs)
+	if len(s.Seen[label]) > MaxSeenUIDs {
+		var toRemove []uint32
+		count := 0
+		target := MaxSeenUIDs / 2
+		for uid := range s.Seen[label] {
+			if count >= target {
+				break
+			}
+			toRemove = append(toRemove, uid)
+			count++
+		}
+		for _, uid := range toRemove {
+			delete(s.Seen[label], uid)
+		}
+	}
 }
 
 func (s *SeenStatus) isSeen(label string, uid uint32) bool {
@@ -88,6 +111,18 @@ func (s *SeenStatus) isSeen(label string, uid uint32) bool {
 	_, ok := s.Seen[label][uid]
 	return ok
 }
+
+// Constants for timeouts and intervals
+const (
+	DefaultHTTPTimeout    = 15 * time.Second
+	DefaultOAuth2Timeout  = 30 * time.Second
+	IMAPKeepAlive        = 5 * time.Minute
+	ReconnectDelay       = 5 * time.Second
+	OAuth2FlowTimeout    = 5 * time.Minute
+	IdleStopTimeout      = 5 * time.Second
+	TokenExpiryMargin    = 60 * time.Second
+	DefaultTokenExpiry   = 1 * time.Hour
+)
 
 // debug flags set from main
 var (
@@ -121,6 +156,15 @@ func tokenStorePath() string {
 
 func loadTokenStore(log *zap.SugaredLogger) (map[string]string, error) {
 	p := tokenStorePath()
+	
+	// Check file permissions for security
+	if info, err := os.Stat(p); err == nil {
+		mode := info.Mode()
+		if mode&0o077 != 0 {
+			log.Warnf("Token store file %s has unsafe permissions %o, should be 0600", p, mode)
+		}
+	}
+	
 	f, err := os.Open(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -150,7 +194,7 @@ func saveTokenStore(log *zap.SugaredLogger, m map[string]string) error {
 	if err := os.MkdirAll(d, 0o700); err != nil {
 		return err
 	}
-	f, err := os.Create(p)
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -205,7 +249,7 @@ func getAccessTokenFromRefreshToken(ctx context.Context, log *zap.SugaredLogger,
 		return "", time.Time{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpClient := &http.Client{Timeout: DefaultHTTPTimeout}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", time.Time{}, err
@@ -216,8 +260,8 @@ func getAccessTokenFromRefreshToken(ctx context.Context, log *zap.SugaredLogger,
 		}
 	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", time.Time{}, fmt.Errorf("token endpoint returned status %d: %s", resp.StatusCode, string(body))
+		_, _ = io.ReadAll(resp.Body) // Read and discard body to prevent information leakage
+		return "", time.Time{}, fmt.Errorf("token endpoint returned status %d", resp.StatusCode)
 	}
 	var tokenResp struct {
 		AccessToken string `json:"access_token"`
@@ -229,7 +273,7 @@ func getAccessTokenFromRefreshToken(ctx context.Context, log *zap.SugaredLogger,
 	}
 	expiry := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 	if tokenResp.ExpiresIn == 0 {
-		expiry = time.Now().Add(1 * time.Hour)
+		expiry = time.Now().Add(DefaultTokenExpiry)
 	}
 	return tokenResp.AccessToken, expiry, nil
 }
@@ -250,7 +294,7 @@ func fetchAccessToken(ctx context.Context, log *zap.SugaredLogger, label, userna
 	tokenCache.Lock()
 	item, ok := tokenCache.m[primaryKey]
 	tokenCache.Unlock()
-	const margin = 60 * time.Second
+	const margin = TokenExpiryMargin
 	if ok && time.Now().Add(margin).Before(item.Expiry) && item.AccessToken != "" {
 		return item.AccessToken, nil
 	}
@@ -439,7 +483,7 @@ func startIdle(ctx context.Context, c *client.Client) func() error {
 	go func() { doneIdle <- c.Idle(stopIdle, nil) }()
 
 	return func() error {
-		return withTimeout(ctx, 5*time.Second, func() error {
+		return withTimeout(ctx, IdleStopTimeout, func() error {
 			close(stopIdle)
 			return <-doneIdle
 		})
@@ -472,7 +516,7 @@ func printMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages 
 }
 
 func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration) {
-	keepAlive := 5 * time.Minute
+	keepAlive := IMAPKeepAlive
 	for {
 		select {
 		case <-ctx.Done():
@@ -485,7 +529,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		c, err := client.DialTLS(addr, nil)
 		if err != nil {
 			log.Errorf("%s: connection error: %v", conf.Label, err)
-			time.Sleep(5 * time.Second)
+			time.Sleep(ReconnectDelay)
 			continue
 		}
 
@@ -501,14 +545,14 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 				time.Sleep(5 * time.Second)
 				continue
 			}
-			tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			tctx, cancel := context.WithTimeout(ctx, DefaultOAuth2Timeout)
 			var token string
 			token, err = fetchAccessToken(tctx, log, conf.Label, conf.Username, conf.OAuth2)
 			cancel()
 			if err != nil {
 				log.Errorf("%s: cannot get OAuth2 token: %v", conf.Label, err)
 				_ = c.Logout()
-				time.Sleep(5 * time.Second)
+				time.Sleep(ReconnectDelay)
 				continue
 			}
 			if globalDebugTokens {
@@ -520,7 +564,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 				log.Errorf("%s: OAuth2 auth failed: %v", conf.Label, err)
 				log.Infof("Tip: start with --imap-trace to see the IMAP dialog.")
 				_ = c.Logout()
-				time.Sleep(5 * time.Second)
+				time.Sleep(ReconnectDelay)
 				cacheKey := conf.OAuth2.TokenURL + "|" + conf.Username + "|" + conf.Label
 				tokenCache.Lock()
 				delete(tokenCache.m, cacheKey)
@@ -531,7 +575,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			if err = c.Login(conf.Username, conf.Password); err != nil {
 				log.Errorf("%s: login error: %v", conf.Label, err)
 				_ = c.Logout()
-				time.Sleep(5 * time.Second)
+				time.Sleep(ReconnectDelay)
 				continue
 			}
 		}
@@ -607,7 +651,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			}
 		}
 		_ = c.Logout()
-		time.Sleep(5 * time.Second)
+		time.Sleep(ReconnectDelay)
 	}
 }
 
@@ -685,7 +729,12 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 		}
 	}()
 	if redirectURI == "" {
-		port := ln.Addr().(*net.TCPAddr).Port
+		addr := ln.Addr()
+		tcpAddr, ok := addr.(*net.TCPAddr)
+		if !ok {
+			return fmt.Errorf("listener address is not TCP: %T", addr)
+		}
+		port := tcpAddr.Port
 		redirectURI = fmt.Sprintf("http://127.0.0.1:%d%s", port, cbPath)
 	}
 
@@ -770,7 +819,7 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 			return err
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		hc := &http.Client{Timeout: 15 * time.Second}
+		hc := &http.Client{Timeout: DefaultHTTPTimeout}
 		resp, err := hc.Do(req)
 		if err != nil {
 			return err
@@ -781,8 +830,8 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 			}
 		}()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			b, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, string(b))
+			_, _ = io.ReadAll(resp.Body) // Read and discard body to prevent information leakage
+			return fmt.Errorf("token endpoint returned %d", resp.StatusCode)
 		}
 		var tr struct {
 			AccessToken  string `json:"access_token"`
@@ -811,7 +860,7 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 	case err := <-errCh:
 		_ = server.Close()
 		return err
-	case <-time.After(5 * time.Minute):
+	case <-time.After(OAuth2FlowTimeout):
 		_ = server.Close()
 		return fmt.Errorf("timeout waiting for authorization code")
 	}
@@ -850,12 +899,38 @@ func main() {
 	globalIMAPTrace = imapTrace
 	log.Infof("Starting %s", appName)
 
+	// Validate configuration file path for security
+	if strings.Contains(confFile, "..") {
+		log.Fatalf("Configuration file path cannot contain '..': %s", confFile)
+	}
+
 	data, err := os.ReadFile(confFile)
 	if err != nil {
 		log.Fatalf("Error reading configuration file: %s", err)
 	}
 	if err = yaml.Unmarshal(data, &configuration); err != nil {
 		log.Fatalf("Error parsing configuration file: %s", err)
+	}
+
+	// Validate configuration for security issues
+	for i, conf := range configuration.Providers {
+		if strings.TrimSpace(conf.Label) == "" {
+			log.Fatalf("Provider %d: label cannot be empty", i)
+		}
+		if strings.TrimSpace(conf.Host) == "" {
+			log.Fatalf("Provider %s: host cannot be empty", conf.Label)
+		}
+		if conf.Port <= 0 || conf.Port > 65535 {
+			log.Fatalf("Provider %s: invalid port %d", conf.Label, conf.Port)
+		}
+		if conf.OAuth2 != nil {
+			if conf.OAuth2.RedirectURI != "" {
+				if u, err := url.Parse(conf.OAuth2.RedirectURI); err != nil || 
+				   (u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1") {
+					log.Fatalf("Provider %s: redirect_uri must be localhost or 127.0.0.1", conf.Label)
+				}
+			}
+		}
 	}
 
 	if doLogin {
