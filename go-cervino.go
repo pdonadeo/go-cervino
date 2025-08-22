@@ -68,32 +68,32 @@ const (
 )
 
 type SeenStatus struct {
-	Lock sync.Mutex
-	Seen map[string]map[uint32]struct{} // key: conf.Label -> set of notified UIDs
+	mu   sync.Mutex
+	seen map[string]map[uint32]struct{} // key: conf.Label -> set of notified UIDs
 }
 
 func NewSeenStatus() *SeenStatus {
 	return &SeenStatus{
-		Seen: make(map[string]map[uint32]struct{}),
+		seen: make(map[string]map[uint32]struct{}),
 	}
 }
 
 func (s *SeenStatus) markSeen(label string, uids []uint32) {
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
-	if _, ok := s.Seen[label]; !ok {
-		s.Seen[label] = make(map[uint32]struct{})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seen[label]; !ok {
+		s.seen[label] = make(map[uint32]struct{})
 	}
 	for _, u := range uids {
-		s.Seen[label][u] = struct{}{}
+		s.seen[label][u] = struct{}{}
 	}
 
 	// Simple cleanup: if we exceed max UIDs, remove half of them (oldest UIDs)
-	if len(s.Seen[label]) > MaxSeenUIDs {
+	if len(s.seen[label]) > MaxSeenUIDs {
 		var toRemove []uint32
 		count := 0
 		target := MaxSeenUIDs / 2
-		for uid := range s.Seen[label] {
+		for uid := range s.seen[label] {
 			if count >= target {
 				break
 			}
@@ -101,16 +101,60 @@ func (s *SeenStatus) markSeen(label string, uids []uint32) {
 			count++
 		}
 		for _, uid := range toRemove {
-			delete(s.Seen[label], uid)
+			delete(s.seen[label], uid)
 		}
 	}
 }
 
 func (s *SeenStatus) isSeen(label string, uid uint32) bool {
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
-	_, ok := s.Seen[label][uid]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.seen[label][uid]
 	return ok
+}
+
+func (s *SeenStatus) getSeenByLabel(label string) []uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var uids []uint32
+	for uid := range s.seen[label] {
+		uids = append(uids, uid)
+	}
+	return uids
+}
+
+type NotificationMap struct {
+	mu       sync.Mutex
+	notified map[string]map[uint32]uint32 // key: conf.Label -> map of UID to notification ID
+}
+
+func NewNotifications() *NotificationMap {
+	return &NotificationMap{
+		notified: make(map[string]map[uint32]uint32),
+	}
+}
+
+func (n *NotificationMap) add(label string, msgUID uint32, ntfID uint32) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if _, ok := n.notified[label]; !ok {
+		n.notified[label] = make(map[uint32]uint32)
+	}
+	n.notified[label][msgUID] = ntfID
+}
+
+func (n *NotificationMap) remove(label string, msgUID uint32) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if ntfs, ok := n.notified[label]; ok {
+		if ntfID, ok := ntfs[msgUID]; ok {
+			delete(ntfs, msgUID)
+			err := notify.CloseNotification(ntfID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error closing notification ID %d: %s\n", ntfID, err)
+			}
+		}
+	}
 }
 
 // Constants for timeouts and intervals
@@ -131,6 +175,7 @@ var (
 	globalIMAPTrace   bool
 	globalDebugTokens bool
 	seenStatus        = NewSeenStatus()
+	notifications     = NewNotifications()
 )
 
 // tokenCacheItem stores an access token and its expiration.
@@ -465,7 +510,16 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 		if conf.Sound != "" {
 			ntf.Hints[notify.HintSoundFile] = conf.Sound
 		}
-		_, _ = ntf.Show()
+
+		notificationID, err := ntf.Show()
+		if err == nil {
+			notifications.add(conf.Label, uid, notificationID)
+			log.Infof("%s: new email notification shown (message UID %d)", conf.Label, uid)
+			log.Infof("%s:     Subject: %s", conf.Label, subject)
+			log.Infof("%s:     From: %s", conf.Label, fromName)
+		} else {
+			log.Errorf("%s: failed to show notification for UID %d: %v", conf.Label, uid, err)
+		}
 
 		newly = append(newly, uid)
 	}
@@ -635,9 +689,9 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 					_ = c.Terminate()
 					break loop
 				}
-				switch update.(type) {
+				switch update := update.(type) {
 				case *client.MailboxUpdate:
-					uids, err := fetchUnseenUIDs(c)
+					uids, err = fetchUnseenUIDs(c)
 					if err != nil {
 						log.Errorf("%s: search unseen error: %v", conf.Label, err)
 						break loop
@@ -654,6 +708,32 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 						break loop
 					}
 					notifyNewUIDs(log, conf, msgs)
+				case *client.ExpungeUpdate:
+					log.Debugf("%s: expunge update: %d", conf.Label, update.SeqNum)
+					seenUids := seenStatus.getSeenByLabel(conf.Label)
+					stillPresentUids, err := fetchUnseenUIDs(c)
+					if err != nil {
+						log.Errorf("%s: search unseen error: %v", conf.Label, err)
+						break loop
+					}
+					missingUIDs := make([]uint32, 0)
+					// Now we populate missingUIDs with UIDs that were seen but are no longer present
+					presentSet := make(map[uint32]struct{}, len(stillPresentUids))
+					for _, u := range stillPresentUids {
+						presentSet[u] = struct{}{}
+					}
+					for _, u := range seenUids {
+						if _, ok := presentSet[u]; !ok {
+							missingUIDs = append(missingUIDs, u)
+						}
+					}
+
+					if len(missingUIDs) > 0 {
+						log.Debugf("%s: detected %d missing UIDs after expunge: %v", conf.Label, len(missingUIDs), missingUIDs)
+						for _, mu := range missingUIDs {
+							notifications.remove(conf.Label, mu)
+						}
+					}
 				}
 				stopIdle = startIdle(ctx, c)
 			case <-time.After(keepAlive):
