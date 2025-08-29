@@ -31,6 +31,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var version = ""
+
 // OAuth2Config contains the fields required to obtain access/refresh tokens.
 // Supports authorization code flow (with local redirect).
 type OAuth2Config struct {
@@ -984,6 +986,7 @@ func main() {
 	var doLogin bool
 	var openAuthURL bool
 	var imapTrace bool
+	var showVersion bool
 
 	flag.StringVar(&confFile, "c", "config.yaml", "Configuration file")
 	flag.StringVar(&confFile, "configuration", "config.yaml", "Configuration file")
@@ -991,7 +994,13 @@ func main() {
 	flag.BoolVar(&doLogin, "login", false, "Perform interactive login (authorization code) for all providers and exit")
 	flag.BoolVar(&openAuthURL, "open-browser", false, "Try to automatically open the browser during login")
 	flag.BoolVar(&imapTrace, "imap-trace", false, "Print IMAP dialog")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(getVersion())
+		return
+	}
 
 	if debug {
 		level.SetLevel(zap.DebugLevel)
@@ -1069,4 +1078,17 @@ func main() {
 
 	wg.Wait()
 	log.Infof("go-cervino exiting, goodbye!")
+}
+
+func getVersion() string {
+	if version != "" {
+		return version
+	}
+	cmd := exec.Command("git", "describe", "--tags", "--dirty", "--always")
+	cmd.Dir = "."
+	out, err := cmd.Output()
+	if err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	return "unknown"
 }
