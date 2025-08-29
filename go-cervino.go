@@ -530,7 +530,11 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 }
 
 func withTimeout(ctx context.Context, timeout time.Duration, fn func() error) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	if ctx.Err() != nil {
+		return fmt.Errorf("parent context already expired: %w", ctx.Err())
+	}
+
+	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	done := make(chan error, 1)
@@ -541,8 +545,15 @@ func withTimeout(ctx context.Context, timeout time.Duration, fn func() error) er
 	select {
 	case err := <-done:
 		return err
-	case <-ctx.Done():
-		return fmt.Errorf("operation timed out after %s", timeout)
+	case <-ctxTimeout.Done():
+		switch ctxTimeout.Err() {
+		case context.DeadlineExceeded:
+			return fmt.Errorf("operation timed out after %s", timeout) // Caso 2: timeout locale
+		case context.Canceled:
+			return nil
+		default:
+			return fmt.Errorf("unknown context error: %w", ctxTimeout.Err())
+		}
 	}
 }
 
@@ -674,13 +685,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		for {
 			select {
 			case <-ctx.Done():
-				err := stopIdle()
-				if err != nil {
-					log.Errorf("%s: error stopping idle: %v", conf.Label, err)
-					_ = c.Terminate()
-				} else {
-					_ = c.Logout()
-				}
+				log.Infof("%s: signal received, shutting down client", conf.Label)
 				return
 			case update := <-updates:
 				err := stopIdle()
@@ -1063,4 +1068,5 @@ func main() {
 	}
 
 	wg.Wait()
+	log.Infof("go-cervino exiting, goodbye!")
 }
