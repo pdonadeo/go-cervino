@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="1000"
+   height="320"
+   viewBox="0 0 1000 320"
+   version="1.1"
+   id="svg9"
+   sodipodi:docname="go-cervino_logo_wordmark.svg"
+   inkscape:version="1.4.2 (ebf0e940d0, 2025-05-08)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview9"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="0.929"
+     inkscape:cx="572.12056"
+     inkscape:cy="129.17115"
+     inkscape:window-width="1898"
+     inkscape:window-height="1030"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="svg9" />
+  <defs
+     id="defs2">
+    <linearGradient
+       id="skyGrad"
+       x1="0"
+       y1="0"
+       x2="0"
+       y2="1">
+      <stop
+         offset="0%"
+         stop-color="#38bdf8"
+         id="stop1" />
+      <stop
+         offset="100%"
+         stop-color="#0f172a"
+         id="stop2" />
+    </linearGradient>
+  </defs>
+  <!-- Icon (same as primary, slightly smaller) -->
+  <g
+     transform="translate(24,24)"
+     id="g8">
+    <circle
+       cx="128"
+       cy="128"
+       r="120"
+       fill="url(#skyGrad)"
+       id="circle2" />
+    <circle
+       cx="128"
+       cy="128"
+       r="120"
+       fill="none"
+       stroke="#0b1220"
+       stroke-opacity="0.25"
+       stroke-width="2"
+       id="circle3" />
+    <path
+       d="M36 182 L86 102 L104 124 L132 94 L220 186 L36 186 Z"
+       fill="#ffffff"
+       fill-opacity="0.95"
+       id="path3" />
+    <path
+       d="M54 196 C92 188, 164 188, 202 196"
+       fill="none"
+       stroke="#a5f3fc"
+       stroke-opacity="0.45"
+       stroke-width="3"
+       stroke-linecap="round"
+       id="path4" />
+    <path
+       d="M62 206 C100 198, 156 198, 194 206"
+       fill="none"
+       stroke="#a5f3fc"
+       stroke-opacity="0.30"
+       stroke-width="2.5"
+       stroke-linecap="round"
+       id="path5" />
+    <path
+       d="M70 214 C108 206, 148 206, 186 214"
+       fill="none"
+       stroke="#a5f3fc"
+       stroke-opacity="0.20"
+       stroke-width="2"
+       stroke-linecap="round"
+       id="path6" />
+    <rect
+       x="80"
+       y="116"
+       width="96"
+       height="64"
+       rx="8"
+       fill="#e2e8f0"
+       stroke="#0f172a"
+       stroke-opacity="0.18"
+       stroke-width="2"
+       id="rect6" />
+    <path
+       d="M80 116 L128 148 L176 116"
+       fill="none"
+       stroke="#0f172a"
+       stroke-opacity="0.28"
+       stroke-width="2"
+       id="path7" />
+    <rect
+       x="92"
+       y="124"
+       width="28"
+       height="14"
+       rx="3"
+       fill="#0f172a"
+       fill-opacity="0.85"
+       id="rect7" />
+    <path
+       d="M98 131 L107 126 L107 136 Z"
+       fill="#38bdf8"
+       id="path8" />
+    <rect
+       x="111"
+       y="129"
+       width="6"
+       height="4"
+       rx="1"
+       fill="#38bdf8"
+       id="rect8" />
+    <circle
+       cx="174"
+       cy="114"
+       r="11"
+       fill="#ef4444"
+       stroke="#ffffff"
+       stroke-width="3"
+       id="circle8" />
+  </g>
+  <!-- Wordmark -->
+  <g
+     id="g11"
+     transform="translate(3.2292788,-6.1307439)">
+    <g
+       id="g10">
+      <text
+         x="320"
+         y="160"
+         font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace"
+         font-size="88px"
+         font-weight="700"
+         fill="#0f172a"
+         letter-spacing="1"
+         id="text8"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:88px;font-family:'Hack Nerd Font Mono';-inkscape-font-specification:'Hack Nerd Font Mono, Bold';font-variant-ligatures:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-east-asian:normal;letter-spacing:1;fill:#0f172a">go-cervino</text>
+      <circle
+         cx="885.91083"
+         cy="124.8418"
+         r="10"
+         fill="#ef4444"
+         stroke="#ffffff"
+         stroke-width="3"
+         id="circle9" />
+    </g>
+    <text
+       x="323.83731"
+       y="210.1636"
+       font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace"
+       font-size="24px"
+       fill="#334155"
+       letter-spacing="0.5"
+       id="text9"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:26.8478px;font-family:'Hack Nerd Font Propo';-inkscape-font-specification:'Hack Nerd Font Propo, Normal';font-variant-ligatures:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-east-asian:normal;letter-spacing:0.559327;fill:#334155;stroke-width:0.999999"><tspan
+         sodipodi:role="line"
+         id="tspan9"
+         x="323.83731"
+         y="210.1636"
+         style="stroke-width:0.999999">IMAP notifier for Linux</tspan><tspan
+         sodipodi:role="line"
+         id="tspan10"
+         x="323.83731"
+         y="243.72336"
+         style="stroke-width:0.999999">OAuth2, IDLE, DBus notifications</tspan></text>
+  </g>
+  <title
+     id="title9">go-cervino — icon + wordmark</title>
+</svg>
