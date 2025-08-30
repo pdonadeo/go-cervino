@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Europe/Rome"
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:15"
+      timezone: "Europe/Rome"
+    labels:
+      - dependencies
+      - github_actions
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      bump-actions:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
