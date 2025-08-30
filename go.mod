@@ -13,5 +13,5 @@ require (
 require (
 	github.com/godbus/dbus/v5 v5.0.3 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/text v0.3.7 // indirect
+	golang.org/x/text v0.3.8 // indirect
 )
