@@ -10,15 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="#build">
-    <img alt="Build" src="https://img.shields.io/badge/Build-go%20build-blue">
-  </a>
-  <a href="#configuration">
-    <img alt="Config" src="https://img.shields.io/badge/Config-YAML-orange">
-  </a>
-  <a href="#oauth2-quick-start">
-    <img alt="OAuth2 quick start" src="https://img.shields.io/badge/OAuth2-quick%20start-9cf">
-  </a>
+  <a href="#build"><img alt="Build" src="https://img.shields.io/badge/Build-go%20build-blue"></a>
+  <a href="#configuration"><img alt="Config" src="https://img.shields.io/badge/Config-YAML-orange"></a>
+  <a href="#oauth2-quick-start"><img alt="OAuth2 quick start" src="https://img.shields.io/badge/OAuth2-quick%20start-9cf"></a>
 </p>
 
 ---
