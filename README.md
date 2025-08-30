@@ -1,3 +1,29 @@
+<!-- HERO -->
+<p align="center">
+  <img src="assets/go-cervino_logo_wordmark.svg"
+       alt="go-cervino — IMAP notifier for Linux"
+       width="760">
+</p>
+
+<p align="center">
+  <em>Dead simple IMAP desktop notification daemon for Linux — OAuth2 • IDLE • DBus</em>
+</p>
+
+<p align="center">
+  <a href="#build">
+    <img alt="Build" src="https://img.shields.io/badge/Build-go%20build-blue">
+  </a>
+  <a href="#configuration">
+    <img alt="Config" src="https://img.shields.io/badge/Config-YAML-orange">
+  </a>
+  <a href="#oauth2-quick-start">
+    <img alt="OAuth2 quick start" src="https://img.shields.io/badge/OAuth2-quick%20start-9cf">
+  </a>
+</p>
+
+---
+
+
 # go-cervino
 
 Dead simple IMAP desktop notification daemon that Just Works™!
