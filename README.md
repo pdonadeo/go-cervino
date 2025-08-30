@@ -1,8 +1,11 @@
 <!-- HERO -->
 <p align="center">
-  <img src="assets/go-cervino_logo_wordmark.svg"
-       alt="go-cervino — IMAP notifier for Linux"
-       width="760">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/go-cervino_logo_wordmark-dark.svg">
+    <img src="assets/go-cervino_logo_wordmark-light.svg"
+         alt="go-cervino — IMAP notifier for Linux"
+         width="760">
+  </picture>
 </p>
 
 <p align="center">
