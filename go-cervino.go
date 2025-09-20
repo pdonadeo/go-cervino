@@ -531,12 +531,8 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 	printMessages(log, conf, msgs)
 }
 
-func withTimeout(ctx context.Context, timeout time.Duration, fn func() error) error {
-	if ctx.Err() != nil {
-		return fmt.Errorf("parent context already expired: %w", ctx.Err())
-	}
-
-	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
+func withTimeout(timeout time.Duration, fn func() error) error {
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	done := make(chan error, 1)
@@ -551,22 +547,20 @@ func withTimeout(ctx context.Context, timeout time.Duration, fn func() error) er
 		switch ctxTimeout.Err() {
 		case context.DeadlineExceeded:
 			return fmt.Errorf("operation timed out after %s", timeout) // Caso 2: timeout locale
-		case context.Canceled:
-			return nil
 		default:
 			return fmt.Errorf("unknown context error: %w", ctxTimeout.Err())
 		}
 	}
 }
 
-func startIdle(ctx context.Context, c *client.Client) func() error {
+func startIdle(c *client.Client) func() error {
 	stopIdle := make(chan struct{})
 	doneIdle := make(chan error, 1)
 
 	go func() { doneIdle <- c.Idle(stopIdle, nil) }()
 
 	return func() error {
-		return withTimeout(ctx, IdleStopTimeout, func() error {
+		return withTimeout(IdleStopTimeout, func() error {
 			close(stopIdle)
 			return <-doneIdle
 		})
@@ -681,15 +675,20 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			continue
 		}
 		printMailboxStatus(log, "Mailbox selected", conf, inboxStatus)
-		stopIdle := startIdle(ctx, c)
+		stopIdle := startIdle(c)
 
 	loop:
 		for {
 			select {
 			case <-ctx.Done():
 				log.Infof("%s: signal received, shutting down client", conf.Label)
+				_ = stopIdle()
+				_ = c.Terminate()
 				return
-			case update := <-updates:
+			case update, ok := <-updates:
+				if !ok {
+					break loop
+				}
 				err := stopIdle()
 				if err != nil {
 					log.Errorf("%s: error stopping idle: %v", conf.Label, err)
@@ -742,7 +741,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 						}
 					}
 				}
-				stopIdle = startIdle(ctx, c)
+				stopIdle = startIdle(c)
 			case <-time.After(keepAlive):
 				err := stopIdle()
 				if err != nil {
@@ -750,10 +749,17 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 					_ = c.Terminate()
 					break loop
 				}
-				stopIdle = startIdle(ctx, c)
+				stopIdle = startIdle(c)
 			}
 		}
-		_ = c.Logout()
+		if ctx.Err() != nil {
+			_ = c.Terminate()
+			return
+		} else {
+			_ = withTimeout(3*time.Second, func() error {
+				return c.Logout()
+			})
+		}
 		time.Sleep(ReconnectDelay)
 	}
 }
