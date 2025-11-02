@@ -23,7 +23,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/TheCreeper/go-notify"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-sasl"
@@ -58,7 +57,17 @@ type ProviderConfiguration struct {
 	OAuth2   *OAuth2Config `yaml:"oauth2"`
 }
 
+type IMAPClient struct {
+	Name        string `yaml:"name"`
+	CommandLine string `yaml:"command_line"`
+}
+
+type GeneralConfiguration struct {
+	IMAPClient IMAPClient `yaml:"imap_client"`
+}
+
 type Configuration struct {
+	General   GeneralConfiguration    `yaml:"general"`
 	Providers []ProviderConfiguration `yaml:"providers"`
 }
 
@@ -145,13 +154,21 @@ func (n *NotificationMap) add(label string, msgUID uint32, ntfID uint32) {
 	n.notified[label][msgUID] = ntfID
 }
 
-func (n *NotificationMap) remove(label string, msgUID uint32) {
+func (n *NotificationMap) remove(log *zap.SugaredLogger, label string, msgUID uint32) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	notifier, err := NewNotifier()
+	if err != nil {
+		log.Errorf("%s: failed to initialize notifier: %v", label, err)
+		os.Exit(1)
+	}
+
 	if ntfs, ok := n.notified[label]; ok {
 		if ntfID, ok := ntfs[msgUID]; ok {
 			delete(ntfs, msgUID)
-			err := notify.CloseNotification(ntfID)
+			// Close notification via DBus
+			err := notifier.CloseNotification(ntfID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error closing notification ID %d: %s\n", ntfID, err)
 			}
@@ -462,8 +479,15 @@ func fetchByUIDs(c *client.Client, uids []uint32) ([]*imap.Message, error) {
 	return out, nil
 }
 
-func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*imap.Message) {
+func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*imap.Message, imapClient IMAPClient) {
 	var newly []uint32
+
+	notifier, err := NewNotifier()
+	if err != nil {
+		log.Errorf("%s: failed to initialize notifier: %v", conf.Label, err)
+		os.Exit(1)
+	}
+
 	for _, msg := range msgs {
 		uid := msg.Uid
 		if seenStatus.isSeen(conf.Label, uid) {
@@ -485,7 +509,6 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 			fromName = msg.Envelope.From[0].PersonalName
 		}
 
-		// Sanitize notification content to prevent potential HTML injection
 		subject := msg.Envelope.Subject
 		if subject == "" {
 			subject = "(no subject)"
@@ -493,27 +516,48 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 		safeSubject := strings.ReplaceAll(strings.ReplaceAll(subject, "<", "&lt;"), ">", "&gt;")
 		safeFromName := strings.ReplaceAll(strings.ReplaceAll(fromName, "<", "&lt;"), ">", "&gt;")
 
-		ntf := notify.NewNotification(
-			"New email in "+conf.Label,
-			fmt.Sprintf("<b>%s</b> from <i>%s</i>", safeSubject, safeFromName),
-		)
-		ntf.AppName = appName
-		if conf.Icon == "" {
-			ntf.AppIcon = "mail-unread"
-		} else {
-			ntf.AppIcon = conf.Icon
+		icon := conf.Icon
+		if icon == "" {
+			icon = "mail-unread"
 		}
+		timeout := int32(0)
 		if conf.Timeout > 0 {
-			ntf.Timeout = conf.Timeout * 1000
-		} else {
-			ntf.Timeout = notify.ExpiresNever
-		}
-		ntf.Hints = make(map[string]interface{})
-		if conf.Sound != "" {
-			ntf.Hints[notify.HintSoundFile] = conf.Sound
+			timeout = conf.Timeout * 1000
 		}
 
-		notificationID, err := ntf.Show()
+		// actions are: key1, label1, key2, label2, ...
+		actions := []string{
+			"open",
+			"Open in " + imapClient.Name,
+		}
+
+		// Show notification via DBus
+		notificationID, err := notifier.ShowNotification(
+			"New email in "+conf.Label,
+			fmt.Sprintf("<b>%s</b> from <i>%s</i>", safeSubject, safeFromName),
+			icon,
+			actions,
+			timeout,
+			func(action string) {
+				if action == "open" {
+					fields := strings.Fields(imapClient.CommandLine)
+					if len(fields) == 0 {
+						log.Errorf("%s: IMAP client command line is empty", conf.Label)
+						return
+					}
+					cmd := exec.Command(fields[0], fields[1:]...)
+					err2 := cmd.Start()
+					if err2 != nil {
+						log.Errorf("%s: failed to execute IMAP client command \"%s\": %v", conf.Label, imapClient.CommandLine, err2)
+						return
+					}
+					go func() {
+						_ = cmd.Wait()
+						log.Debugf("%s: IMAP client (%s) process exited", conf.Label, imapClient.Name)
+					}()
+				}
+			},
+		)
 		if err == nil {
 			notifications.add(conf.Label, uid, notificationID)
 			log.Infof("%s: new email notification shown (message UID %d)", conf.Label, uid)
@@ -592,7 +636,7 @@ func printMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages 
 	}
 }
 
-func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration) {
+func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration, imapClient IMAPClient) {
 	keepAlive := IMAPKeepAlive
 	for {
 		select {
@@ -713,7 +757,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 						log.Errorf("%s: fetch by uid error: %v", conf.Label, err)
 						break loop
 					}
-					notifyNewUIDs(log, conf, msgs)
+					notifyNewUIDs(log, conf, msgs, imapClient)
 				case *client.ExpungeUpdate:
 					log.Debugf("%s: expunge update: %d", conf.Label, update.SeqNum)
 					seenUids := seenStatus.getSeenByLabel(conf.Label)
@@ -737,7 +781,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 					if len(missingUIDs) > 0 {
 						log.Debugf("%s: detected %d missing UIDs after expunge: %v", conf.Label, len(missingUIDs), missingUIDs)
 						for _, mu := range missingUIDs {
-							notifications.remove(conf.Label, mu)
+							notifications.remove(log, conf.Label, mu)
 						}
 					}
 				}
@@ -1078,7 +1122,7 @@ func main() {
 		wg.Add(1)
 		go func(c ProviderConfiguration) {
 			defer wg.Done()
-			runIMAPClient(ctx, log, c)
+			runIMAPClient(ctx, log, c, configuration.General.IMAPClient)
 		}(conf)
 	}
 
