@@ -20,7 +20,6 @@
 
 ---
 
-
 # go-cervino
 
 Dead simple IMAP desktop notification daemon that Just Works™!
@@ -59,6 +58,17 @@ Optional flags:
 - --login: run interactive OAuth2 login for all providers in the config, then exit
 - --open-browser: attempt to auto-open the auth URL during --login
 - --imap-trace: print the IMAP conversation (for debugging)
+
+## Install with go install
+
+You can install go-cervino directly from source using the Go toolchain (Go 1.21 or newer):
+
+```bash
+go install github.com/pdonadeo/go-cervino@latest
+```
+
+This will build and place the `go-cervino` binary in your Go bin directory (usually `$HOME/go/bin`).
+Make sure this directory is in your `PATH` to run `go-cervino` from anywhere.
 
 ## Configuration
 
