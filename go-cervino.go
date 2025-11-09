@@ -44,17 +44,29 @@ type OAuth2Config struct {
 	Scope        []string `yaml:"scope"`
 }
 
+type TrashAction struct {
+	Enabled      bool   `yaml:"enabled"`
+	TrashMailbox string `yaml:"trash_mailbox"`
+	AlsoMarkRead bool   `yaml:"also_mark_read"`
+}
+
+type MarkAsReadAction struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 type ProviderConfiguration struct {
-	Label    string        `yaml:"label"`
-	Host     string        `yaml:"host"`
-	Port     int           `yaml:"port"`
-	Username string        `yaml:"username"`
-	Password string        `yaml:"password"`
-	Mailbox  string        `yaml:"mailbox"`
-	Sound    string        `yaml:"sound"`
-	Icon     string        `yaml:"icon"`
-	Timeout  int32         `yaml:"timeout"`
-	OAuth2   *OAuth2Config `yaml:"oauth2"`
+	Label       string           `yaml:"label"`
+	Host        string           `yaml:"host"`
+	Port        int              `yaml:"port"`
+	Username    string           `yaml:"username"`
+	Password    string           `yaml:"password"`
+	Mailbox     string           `yaml:"mailbox"`
+	Sound       string           `yaml:"sound"`
+	Icon        string           `yaml:"icon"`
+	Timeout     int32            `yaml:"timeout"`
+	OAuth2      *OAuth2Config    `yaml:"oauth2"`
+	TrashAction TrashAction      `yaml:"trash_action"`
+	MarkAsRead  MarkAsReadAction `yaml:"mark_as_read_action"`
 }
 
 type IMAPClient struct {
@@ -77,6 +89,19 @@ const (
 	SeenCleanupInterval = 1 * time.Hour
 	MaxFetchMessages    = 1000 // Maximum messages to fetch at once
 )
+
+type ActionEnum string
+
+const (
+	ActionOpen       ActionEnum = "open"
+	ActionTrash      ActionEnum = "trash"
+	ActionMarkAsRead ActionEnum = "mark_as_read"
+)
+
+type Action struct {
+	Key ActionEnum
+	UID uint32
+}
 
 type SeenStatus struct {
 	mu   sync.Mutex
@@ -479,18 +504,24 @@ func fetchByUIDs(c *client.Client, uids []uint32) ([]*imap.Message, error) {
 	return out, nil
 }
 
-func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*imap.Message, imapClient IMAPClient) {
+func notifyNewUIDs(
+	log *zap.SugaredLogger,
+	providerConf ProviderConfiguration,
+	imapClientConf IMAPClient,
+	msgs []*imap.Message,
+	actionsChan chan Action,
+) {
 	var newly []uint32
 
 	notifier, err := NewNotifier()
 	if err != nil {
-		log.Errorf("%s: failed to initialize notifier: %v", conf.Label, err)
+		log.Errorf("%s: failed to initialize notifier: %v", providerConf.Label, err)
 		os.Exit(1)
 	}
 
 	for _, msg := range msgs {
 		uid := msg.Uid
-		if seenStatus.isSeen(conf.Label, uid) {
+		if seenStatus.isSeen(providerConf.Label, uid) {
 			continue
 		}
 		isNew := true
@@ -516,63 +547,64 @@ func notifyNewUIDs(log *zap.SugaredLogger, conf ProviderConfiguration, msgs []*i
 		safeSubject := strings.ReplaceAll(strings.ReplaceAll(subject, "<", "&lt;"), ">", "&gt;")
 		safeFromName := strings.ReplaceAll(strings.ReplaceAll(fromName, "<", "&lt;"), ">", "&gt;")
 
-		icon := conf.Icon
+		icon := providerConf.Icon
 		if icon == "" {
 			icon = "mail-unread"
 		}
 		timeout := int32(0)
-		if conf.Timeout > 0 {
-			timeout = conf.Timeout * 1000
+		if providerConf.Timeout > 0 {
+			timeout = providerConf.Timeout * 1000
 		}
 
 		// actions are: key1, label1, key2, label2, ...
 		actions := []string{
-			"open",
-			"Open in " + imapClient.Name,
+			string(ActionOpen),
+			"Open in " + imapClientConf.Name,
+		}
+
+		if providerConf.TrashAction.Enabled {
+			label := ""
+			if providerConf.TrashAction.AlsoMarkRead {
+				label = "Mark read & move to trash"
+			} else {
+				label = "Move to trash"
+			}
+			actions = append(actions, string(ActionTrash), label)
+		}
+
+		if providerConf.MarkAsRead.Enabled {
+			actions = append(actions,
+				string(ActionMarkAsRead),
+				"Mark as read",
+			)
 		}
 
 		// Show notification via DBus
 		notificationID, err := notifier.ShowNotification(
-			"New email in "+conf.Label,
+			"New email in "+providerConf.Label,
 			fmt.Sprintf("<b>%s</b> from <i>%s</i>", safeSubject, safeFromName),
 			icon,
 			actions,
 			timeout,
 			func(action string) {
-				if action == "open" {
-					fields := strings.Fields(imapClient.CommandLine)
-					if len(fields) == 0 {
-						log.Errorf("%s: IMAP client command line is empty", conf.Label)
-						return
-					}
-					cmd := exec.Command(fields[0], fields[1:]...)
-					err2 := cmd.Start()
-					if err2 != nil {
-						log.Errorf("%s: failed to execute IMAP client command \"%s\": %v", conf.Label, imapClient.CommandLine, err2)
-						return
-					}
-					go func() {
-						_ = cmd.Wait()
-						log.Debugf("%s: IMAP client (%s) process exited", conf.Label, imapClient.Name)
-					}()
-				}
+				actionsChan <- Action{Key: ActionEnum(action), UID: uid}
 			},
 		)
 		if err == nil {
-			notifications.add(conf.Label, uid, notificationID)
-			log.Infof("%s: new email notification shown (message UID %d)", conf.Label, uid)
-			log.Infof("%s:     Subject: %s", conf.Label, subject)
-			log.Infof("%s:     From: %s", conf.Label, fromName)
+			notifications.add(providerConf.Label, uid, notificationID)
+			log.Infof("%s: new email notification shown (message UID %d)", providerConf.Label, uid)
+			log.Infof("%s:     Subject: %s", providerConf.Label, subject)
+			log.Infof("%s:     From: %s", providerConf.Label, fromName)
 		} else {
-			log.Errorf("%s: failed to show notification for UID %d: %v", conf.Label, uid, err)
+			log.Errorf("%s: failed to show notification for UID %d: %v", providerConf.Label, uid, err)
 		}
 
 		newly = append(newly, uid)
 	}
 	if len(newly) > 0 {
-		seenStatus.markSeen(conf.Label, newly)
+		seenStatus.markSeen(providerConf.Label, newly)
 	}
-	printMessages(log, conf, msgs)
+	printMessages(log, providerConf, msgs)
 }
 
 func withTimeout(timeout time.Duration, fn func() error) error {
@@ -636,7 +668,7 @@ func printMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages 
 	}
 }
 
-func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration, imapClient IMAPClient) {
+func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration, imapClientConf IMAPClient) {
 	keepAlive := IMAPKeepAlive
 	for {
 		select {
@@ -713,13 +745,16 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 
 		updates := make(chan client.Update, 1024)
 		c.Updates = updates
-		inboxStatus, err := c.Select(conf.Mailbox, true)
+		inboxStatus, err := c.Select(conf.Mailbox, false)
 		if err != nil {
 			log.Errorf("%s: select mailbox error: %v", conf.Label, err)
 			continue
 		}
 		printMailboxStatus(log, "Mailbox selected", conf, inboxStatus)
 		stopIdle := startIdle(c)
+
+		// A channel for actions from notifications
+		actionsChan := make(chan Action, 1024)
 
 	loop:
 		for {
@@ -729,6 +764,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 				_ = stopIdle()
 				_ = c.Terminate()
 				return
+
 			case update, ok := <-updates:
 				if !ok {
 					break loop
@@ -757,7 +793,8 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 						log.Errorf("%s: fetch by uid error: %v", conf.Label, err)
 						break loop
 					}
-					notifyNewUIDs(log, conf, msgs, imapClient)
+					notifyNewUIDs(log, conf, imapClientConf, msgs, actionsChan)
+
 				case *client.ExpungeUpdate:
 					log.Debugf("%s: expunge update: %d", conf.Label, update.SeqNum)
 					seenUids := seenStatus.getSeenByLabel(conf.Label)
@@ -786,6 +823,88 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 					}
 				}
 				stopIdle = startIdle(c)
+
+			case action := <-actionsChan:
+				err := stopIdle()
+				if err != nil {
+					log.Errorf("%s: error stopping idle: %v", conf.Label, err)
+					_ = c.Terminate()
+					break loop
+				}
+				switch action.Key {
+				case ActionOpen:
+					fields := strings.Fields(imapClientConf.CommandLine)
+					if len(fields) == 0 {
+						log.Errorf("%s: IMAP client command line is empty", conf.Label)
+						break loop
+					}
+					cmd := exec.Command(fields[0], fields[1:]...)
+					err2 := cmd.Start()
+					if err2 != nil {
+						log.Errorf("%s: failed to execute IMAP client command \"%s\": %v", conf.Label, imapClientConf.CommandLine, err2)
+						break loop
+					}
+					go func() {
+						_ = cmd.Wait()
+						log.Debugf("%s: IMAP client (%s) process exited", conf.Label, imapClientConf.Name)
+					}()
+
+				case ActionTrash:
+					mbox := conf.TrashAction.TrashMailbox
+					if mbox == "" {
+						mbox = "Trash"
+					}
+					seqset := new(imap.SeqSet)
+					seqset.AddNum(action.UID)
+
+					// 1. Optionally Mark as seen
+					if conf.TrashAction.AlsoMarkRead {
+						item := imap.FormatFlagsOp(imap.AddFlags, true)
+						flags := []interface{}{imap.SeenFlag}
+						err2 := c.UidStore(seqset, item, flags, nil)
+						if err2 != nil {
+							log.Errorf("%s: failed to mark message UID %d as seen: %v", conf.Label, action.UID, err2)
+							break loop
+						}
+					}
+
+					// 2. Copy to Trash
+					err2 := c.UidCopy(seqset, mbox)
+					if err2 != nil {
+						log.Errorf("%s: failed to copy message UID %d to mailbox %q: %v", conf.Label, action.UID, mbox, err2)
+						break loop
+					}
+					log.Debugf("%s: message UID %d copied to mailbox %q", conf.Label, action.UID, mbox)
+
+					// 3. Mark as deleted
+					item := imap.FormatFlagsOp(imap.AddFlags, true)
+					flags := []interface{}{imap.DeletedFlag}
+					err2 = c.UidStore(seqset, item, flags, nil)
+					if err2 != nil {
+						log.Errorf("%s: failed to mark message UID %d as deleted: %v", conf.Label, action.UID, err2)
+						break loop
+					}
+
+					// 4. Expunge
+					err2 = c.Expunge(nil)
+					if err2 != nil {
+						log.Errorf("%s: failed to expunge messages: %v", conf.Label, err2)
+						break loop
+					}
+
+				case ActionMarkAsRead:
+					seqset := new(imap.SeqSet)
+					seqset.AddNum(action.UID)
+					item := imap.FormatFlagsOp(imap.AddFlags, true)
+					flags := []interface{}{imap.SeenFlag}
+					err2 := c.UidStore(seqset, item, flags, nil)
+					if err2 != nil {
+						log.Errorf("%s: failed to mark message UID %d as read: %v", conf.Label, action.UID, err2)
+						break loop
+					}
+				}
+				stopIdle = startIdle(c)
+
 			case <-time.After(keepAlive):
 				err := stopIdle()
 				if err != nil {

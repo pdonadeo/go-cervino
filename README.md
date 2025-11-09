@@ -124,6 +124,60 @@ OAuth2 block:
 - redirect_uri: optional localhost redirect; if omitted, a random port is used
 - scope: list of scopes required for IMAP
 
+## Notification Actions
+
+You can enable interactive actions in notifications to quickly "Open in IMAP client", "Move to trash", or "Mark as read" for new emails.
+
+### IMAP Client Integration ("Open in")
+
+Configure your IMAP client globally in the `general` section of your YAML configuration:
+
+```yaml
+general:
+  imap_client:
+    name: "Thunderbird" # Display name for your IMAP client
+    command_line: "thunderbird" # Command to launch your IMAP client (e.g., thunderbird, evolution)
+```
+
+When enabled, notifications for new mail will include a button to open your configured IMAP client. Clicking "Open in Thunderbird" (or your chosen client) will launch the specified command.
+
+### Provider Actions ("Move to trash" and "Mark as read")
+
+Add the following blocks to your provider configuration to enable these actions:
+
+```yaml
+providers:
+  - label: Personal Gmail
+    host: imap.gmail.com
+    port: 993
+    username: your.name@gmail.com
+    mailbox: INBOX
+    # ...other fields...
+    trash_action:
+      enabled: true
+      trash_mailbox: "Trash" # IMAP mailbox to move messages to (default: "Trash")
+      also_mark_read: true # If true, marks the message as read before moving
+    mark_as_read_action:
+      enabled: true # If true, enables "Mark as read" action in notifications
+```
+
+**How it works:**
+
+- **Open in IMAP client:** Notifications include a button to open your configured IMAP client, as set in the `general.imap_client` section.
+- **Move to trash:** If enabled, notifications include a button to move the message to the specified mailbox (default: "Trash"). If `also_mark_read` is true, the message is marked as read before moving.
+- **Mark as read:** If enabled, notifications include a button to mark the message as seen on the IMAP server.
+
+**Fields:**
+
+- `general.imap_client.command_line`: Command to launch your IMAP client.
+- `general.imap_client.name`: Display name for your IMAP client.
+- `trash_action.enabled`: Enable the "Move to trash" action.
+- `trash_action.trash_mailbox`: IMAP mailbox to move messages to (default: "Trash").
+- `trash_action.also_mark_read`: If true, marks the message as read before moving.
+- `mark_as_read_action.enabled`: Enable the "Mark as read" action.
+
+These actions require the IMAP account to have write permissions for the mailbox.
+
 ## OAuth2 quick start
 
 1. Add your provider block with oauth2 in config.yaml (as above).
