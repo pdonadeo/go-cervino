@@ -930,13 +930,11 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 				stopIdle = startIdle(c)
 			}
 		}
+		_ = withTimeout(3*time.Second, func() error {
+			return c.Logout()
+		})
 		if ctx.Err() != nil {
-			_ = c.Terminate()
 			return
-		} else {
-			_ = withTimeout(3*time.Second, func() error {
-				return c.Logout()
-			})
 		}
 		time.Sleep(ReconnectDelay)
 	}
