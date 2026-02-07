@@ -520,6 +520,9 @@ func notifyNewUIDs(
 	}
 
 	for _, msg := range msgs {
+		if msg == nil {
+			continue
+		}
 		uid := msg.Uid
 		if seenStatus.isSeen(providerConf.Label, uid) {
 			continue
@@ -532,6 +535,13 @@ func notifyNewUIDs(
 			}
 		}
 		if !isNew {
+			continue
+		}
+
+		// Guard against nil Envelope
+		if msg.Envelope == nil {
+			log.Warnf("%s: message UID %d has nil Envelope, skipping", providerConf.Label, uid)
+			newly = append(newly, uid)
 			continue
 		}
 
