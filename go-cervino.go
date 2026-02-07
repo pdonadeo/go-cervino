@@ -771,8 +771,13 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			select {
 			case <-ctx.Done():
 				log.Infof("%s: signal received, shutting down client", conf.Label)
-				_ = stopIdle()
-				_ = c.Terminate()
+				if err := stopIdle(); err != nil {
+					log.Errorf("%s: error stopping idle during shutdown: %v", conf.Label, err)
+				}
+				// Give the server time to respond before closing
+				_ = withTimeout(3*time.Second, func() error {
+					return c.Logout()
+				})
 				return
 
 			case update, ok := <-updates:
