@@ -1008,9 +1008,12 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 	if err != nil {
 		return fmt.Errorf("cannot open listener on %s: %v", addr, err)
 	}
+	// server.Shutdown/Close already closes the listener; this defer is a
+	// safety net for early-return paths only.
+	listenerClosed := false
 	defer func() {
-		if err := ln.Close(); err != nil {
-			log.Errorf("Error closing listener: %s", err)
+		if !listenerClosed {
+			_ = ln.Close()
 		}
 	}()
 	if redirectURI == "" {
@@ -1088,6 +1091,7 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 	}
 	select {
 	case code := <-codeCh:
+		listenerClosed = true
 		_ = server.Shutdown(context.Background())
 		form := url.Values{}
 		form.Set("grant_type", "authorization_code")
@@ -1143,9 +1147,11 @@ func runOAuth2Flow(log *zap.SugaredLogger, conf ProviderConfiguration, autoOpen 
 		}
 		return nil
 	case err := <-errCh:
+		listenerClosed = true
 		_ = server.Close()
 		return err
 	case <-time.After(OAuth2FlowTimeout):
+		listenerClosed = true
 		_ = server.Close()
 		return fmt.Errorf("timeout waiting for authorization code")
 	}
