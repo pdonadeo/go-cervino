@@ -28,6 +28,31 @@ func NewNotifier() (*Notifier, error) {
 	return n, nil
 }
 
+var (
+	sharedNotifierMu   sync.Mutex
+	sharedNotifierInst *Notifier
+)
+
+// SharedNotifier returns the process-wide Notifier, creating it on first use.
+// Only one Notifier should ever exist: dbus.SessionBus() hands out a single
+// cached connection, and every Notifier registers its own signal channel and
+// listenActions goroutine on it. For the same reason the returned Notifier must
+// never be closed, as the connection does not belong to it.
+func SharedNotifier() (*Notifier, error) {
+	sharedNotifierMu.Lock()
+	defer sharedNotifierMu.Unlock()
+
+	if sharedNotifierInst != nil {
+		return sharedNotifierInst, nil
+	}
+	n, err := NewNotifier()
+	if err != nil {
+		return nil, err
+	}
+	sharedNotifierInst = n
+	return n, nil
+}
+
 func (n *Notifier) listenActions() {
 	_ = n.conn.AddMatchSignal(
 		dbus.WithMatchInterface("org.freedesktop.Notifications"),

@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -183,7 +184,7 @@ func (n *NotificationMap) remove(log *zap.SugaredLogger, label string, msgUID ui
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	notifier, err := NewNotifier()
+	notifier, err := SharedNotifier()
 	if err != nil {
 		log.Errorf("%s: failed to initialize notifier: %v", label, err)
 		os.Exit(1)
@@ -211,6 +212,7 @@ const (
 	IdleStopTimeout      = 5 * time.Second
 	TokenExpiryMargin    = 60 * time.Second
 	DefaultTokenExpiry   = 1 * time.Hour
+	LoginErrorRenotify   = 1 * time.Hour
 )
 
 // debug flags set from main
@@ -504,6 +506,94 @@ func fetchByUIDs(c *client.Client, uids []uint32) ([]*imap.Message, error) {
 	return out, nil
 }
 
+// escapeMarkup escapes the characters that would otherwise be interpreted as
+// markup in the body of a desktop notification.
+func escapeMarkup(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "<", "&lt;"), ">", "&gt;")
+}
+
+// loginErrorState remembers whether a login failure has already been notified
+// for the current failure streak. runIMAPClient retries every ReconnectDelay,
+// so without this a provider with an expired token would raise a notification
+// every few seconds. One instance per provider, owned by its goroutine.
+type loginErrorState struct {
+	notificationID uint32
+	notified       bool
+	lastNotifiedAt time.Time
+}
+
+// notify shows a desktop notification the first time a login attempt fails and,
+// while the failure persists, at most once every LoginErrorRenotify.
+func (s *loginErrorState) notify(log *zap.SugaredLogger, conf ProviderConfiguration, reason error) {
+	if !s.lastNotifiedAt.IsZero() && time.Since(s.lastNotifiedAt) < LoginErrorRenotify {
+		return
+	}
+	// Marked before showing the notification, so that a failing DBus does not
+	// get hammered once per reconnect attempt either.
+	s.lastNotifiedAt = time.Now()
+	s.notified = true
+
+	notifier, err := SharedNotifier()
+	if err != nil {
+		log.Errorf("%s: failed to initialize notifier: %v", conf.Label, err)
+		return
+	}
+
+	// Dismiss the previous one, so re-notifications replace it instead of
+	// stacking up in the notification centre.
+	s.closeNotification(log, conf, notifier)
+
+	account := conf.Username
+	if account == "" {
+		account = conf.Host
+	}
+
+	// expire_timeout 0: a login failure must stay up until it is dismissed,
+	// which is the whole point of notifying about it.
+	notificationID, err := notifier.ShowNotification(
+		"Login failed: "+conf.Label,
+		fmt.Sprintf("<b>%s</b> — %s", escapeMarkup(account), escapeMarkup(reason.Error())),
+		"dialog-error",
+		[]string{},
+		0,
+		nil,
+	)
+	if err != nil {
+		log.Errorf("%s: failed to show login error notification: %v", conf.Label, err)
+		return
+	}
+	s.notificationID = notificationID
+}
+
+// clear is called after a successful login: it dismisses the pending failure
+// notification, if any, and re-arms notify for the next failure streak.
+func (s *loginErrorState) clear(log *zap.SugaredLogger, conf ProviderConfiguration) {
+	if !s.notified {
+		return
+	}
+	s.notified = false
+	s.lastNotifiedAt = time.Time{}
+
+	notifier, err := SharedNotifier()
+	if err != nil {
+		log.Errorf("%s: failed to initialize notifier: %v", conf.Label, err)
+		s.notificationID = 0
+		return
+	}
+	s.closeNotification(log, conf, notifier)
+	log.Infof("%s: login succeeded again after a failure", conf.Label)
+}
+
+func (s *loginErrorState) closeNotification(log *zap.SugaredLogger, conf ProviderConfiguration, notifier *Notifier) {
+	if s.notificationID == 0 {
+		return
+	}
+	if err := notifier.CloseNotification(s.notificationID); err != nil {
+		log.Errorf("%s: error closing login error notification %d: %v", conf.Label, s.notificationID, err)
+	}
+	s.notificationID = 0
+}
+
 func notifyNewUIDs(
 	log *zap.SugaredLogger,
 	providerConf ProviderConfiguration,
@@ -513,7 +603,7 @@ func notifyNewUIDs(
 ) {
 	var newly []uint32
 
-	notifier, err := NewNotifier()
+	notifier, err := SharedNotifier()
 	if err != nil {
 		log.Errorf("%s: failed to initialize notifier: %v", providerConf.Label, err)
 		os.Exit(1)
@@ -527,14 +617,7 @@ func notifyNewUIDs(
 		if seenStatus.isSeen(providerConf.Label, uid) {
 			continue
 		}
-		isNew := true
-		for _, f := range msg.Flags {
-			if f == imap.SeenFlag {
-				isNew = false
-				break
-			}
-		}
-		if !isNew {
+		if slices.Contains(msg.Flags, imap.SeenFlag) {
 			continue
 		}
 
@@ -554,8 +637,8 @@ func notifyNewUIDs(
 		if subject == "" {
 			subject = "(no subject)"
 		}
-		safeSubject := strings.ReplaceAll(strings.ReplaceAll(subject, "<", "&lt;"), ">", "&gt;")
-		safeFromName := strings.ReplaceAll(strings.ReplaceAll(fromName, "<", "&lt;"), ">", "&gt;")
+		safeSubject := escapeMarkup(subject)
+		safeFromName := escapeMarkup(fromName)
 
 		icon := providerConf.Icon
 		if icon == "" {
@@ -680,6 +763,7 @@ func printMessages(log *zap.SugaredLogger, conf ProviderConfiguration, messages 
 
 func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderConfiguration, imapClientConf IMAPClient) {
 	keepAlive := IMAPKeepAlive
+	var loginErr loginErrorState
 	for {
 		select {
 		case <-ctx.Done():
@@ -704,6 +788,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		if conf.OAuth2 != nil {
 			if strings.TrimSpace(conf.Username) == "" {
 				log.Errorf("%s: missing username: XOAUTH2 requires the full email address (e.g. user@domain)", conf.Label)
+				loginErr.notify(log, conf, fmt.Errorf("missing username: XOAUTH2 requires the full email address"))
 				_ = c.Logout()
 				time.Sleep(5 * time.Second)
 				continue
@@ -714,6 +799,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			cancel()
 			if err != nil {
 				log.Errorf("%s: cannot get OAuth2 token: %v", conf.Label, err)
+				loginErr.notify(log, conf, fmt.Errorf("cannot get OAuth2 token: %w", err))
 				_ = c.Logout()
 				time.Sleep(ReconnectDelay)
 				continue
@@ -725,6 +811,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 			auth := NewXOAuth2(conf.Username, token)
 			if err = c.Authenticate(auth); err != nil {
 				log.Errorf("%s: OAuth2 auth failed: %v", conf.Label, err)
+				loginErr.notify(log, conf, fmt.Errorf("OAuth2 authentication rejected: %w", err))
 				log.Infof("Tip: start with --imap-trace to see the IMAP dialog.")
 				_ = c.Logout()
 				time.Sleep(ReconnectDelay)
@@ -737,12 +824,14 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 		} else {
 			if err = c.Login(conf.Username, conf.Password); err != nil {
 				log.Errorf("%s: login error: %v", conf.Label, err)
+				loginErr.notify(log, conf, fmt.Errorf("login rejected: %w", err))
 				_ = c.Logout()
 				time.Sleep(ReconnectDelay)
 				continue
 			}
 		}
 		log.Debugf("%s logged in", conf.Label)
+		loginErr.clear(log, conf)
 
 		if conf.Mailbox == "" {
 			conf.Mailbox = "INBOX"
@@ -875,7 +964,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 					// 1. Optionally Mark as seen
 					if conf.TrashAction.AlsoMarkRead {
 						item := imap.FormatFlagsOp(imap.AddFlags, true)
-						flags := []interface{}{imap.SeenFlag}
+						flags := []any{imap.SeenFlag}
 						err2 := c.UidStore(seqset, item, flags, nil)
 						if err2 != nil {
 							log.Errorf("%s: failed to mark message UID %d as seen: %v", conf.Label, action.UID, err2)
@@ -893,7 +982,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 
 					// 3. Mark as deleted
 					item := imap.FormatFlagsOp(imap.AddFlags, true)
-					flags := []interface{}{imap.DeletedFlag}
+					flags := []any{imap.DeletedFlag}
 					err2 = c.UidStore(seqset, item, flags, nil)
 					if err2 != nil {
 						log.Errorf("%s: failed to mark message UID %d as deleted: %v", conf.Label, action.UID, err2)
@@ -911,7 +1000,7 @@ func runIMAPClient(ctx context.Context, log *zap.SugaredLogger, conf ProviderCon
 					seqset := new(imap.SeqSet)
 					seqset.AddNum(action.UID)
 					item := imap.FormatFlagsOp(imap.AddFlags, true)
-					flags := []interface{}{imap.SeenFlag}
+					flags := []any{imap.SeenFlag}
 					err2 := c.UidStore(seqset, item, flags, nil)
 					if err2 != nil {
 						log.Errorf("%s: failed to mark message UID %d as read: %v", conf.Label, action.UID, err2)

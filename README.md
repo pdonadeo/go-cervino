@@ -229,6 +229,10 @@ Notes:
 - The app selects the mailbox in read-only mode and never alters flags.
 - On startup it records the current unseen UIDs to avoid retroactive notifications.
 - Notifications are sent once per new message UID per session.
+- A failed login (wrong password, expired or revoked OAuth2 token) also raises a desktop notification, so a
+  broken account does not go unnoticed in the logs. It never expires, is repeated at most once per hour while
+  the account keeps failing, and is dismissed automatically as soon as the account logs in again. Connection
+  errors are not notified, only authentication ones.
 
 ## Systemd service (optional)
 
