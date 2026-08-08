@@ -1,25 +1,53 @@
-name: Release
+name: Release Binaries
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    name: Create GitHub Release
+  build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
     steps:
-      - name: Create Release
-        uses: softprops/action-gh-release@v3
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
-          # To attach build artifacts, provide paths (globs supported), e.g.:
-          # files: |
-          #   dist/**
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install upx
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: Build (${{ matrix.arch }})
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          set -o pipefail
+
+          VERSION="$(git describe --tags --always --dirty)"
+          echo "Version: $VERSION"
+
+          go build -trimpath -ldflags="-s -w -X main.version=$VERSION" \
+            -o "go-cervino-linux-${{ matrix.arch }}" .
+          upx "go-cervino-linux-${{ matrix.arch }}"
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "go-cervino-linux-${{ matrix.arch }}" --clobber \
+            --repo "${{ github.repository }}"
